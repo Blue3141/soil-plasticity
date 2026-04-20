@@ -1,0 +1,99 @@
+/*
+ * Test: capsule landing on terrestrial dry sand
+ *
+ * A mass (100 kg) falls from 0.5 m height onto a single-leg Bekker-Wong
+ * soil model. The test verifies:
+ *   1. Loading force follows Bekker-Wong power law F = A*K*z^n
+ *   2. Permanent sinkage is non-zero after load removal
+ *   3. Unloading stiffness is Ku = n*K*z_max^(n-1)
+ *
+ * Expected static equilibrium sinkage (100 kg * 9.81 m/s^2 = 981 N):
+ *   z_static = (F / (A * K_bek))^(1/n)
+ *   K_bek = kc/b + kphi = 990/0.15 + 1528000 = 1534600 N/m^(n+2) * m^2/A...
+ *   (solve numerically from the Bekker equation)
+ *
+ * Terrain: terrestrial dry sand
+ *   kc=990 N/m^(n+1), kphi=1528000 N/m^(n+2), n=1.1, b=0.15 m
+ *
+ * Usage:
+ *   mbdyn -f terrestrial_sand.mbd -o terrestrial_sand
+ *
+ * Load the module first (adjust path to .so as needed):
+ *   module load: "libmodule-soil-plasticity";
+ */
+
+begin: data;
+    problem: initial value;
+end: data;
+
+begin: initial value;
+    initial time: 0.;
+    final time: 2.;
+    time step: 1.e-3;
+    max iterations: 20;
+    tolerance: 1.e-6;
+    method: ms, 0.6;
+    output: iterations;
+end: initial value;
+
+begin: control data;
+    structural nodes: 2;
+    rigid bodies: 1;
+    joints: 2;
+    gravity;
+    use: loadable elements, in assembly;
+end: control data;
+
+# Load the Bekker soil module
+module load: "libmodule-soil-plasticity";
+
+begin: nodes;
+    # Ground node (fixed)
+    structural node: 1,
+        static,
+        0., 0., 0.,   # position
+        eye,          # orientation
+        null,         # velocity
+        null;         # angular velocity
+
+    # Capsule node (initially 0.5 m above ground, i.e. rod length = 0.5 m)
+    structural node: 2,
+        dynamic,
+        0., 0., 0.5,  # position
+        eye,
+        null,
+        null;
+end: nodes;
+
+begin: elements;
+    gravity: 0., 0., -1., const, 9.81;
+
+    # Capsule body: 100 kg point mass
+    body: 1,
+        2,            # node label
+        100.,         # mass [kg]
+        null,         # center of mass offset
+        null;         # inertia tensor (point mass)
+
+    # Ground constraint: fix ground node
+    joint: 1, clamp, 1, node, node;
+
+    # Soil contact: Rod from capsule node to ground node
+    # Rod natural length = 0.5 m (initial separation)
+    # When capsule descends below 0 m, Epsilon becomes negative (sign=negative)
+    # -> z = -Epsilon > 0 -> Bekker law activates
+    joint: 2, rod,
+        2,           # capsule node
+        1,           # ground node
+        0.5,         # rod natural length [m] = initial height
+        constitutive law, 1D, bekker soil,
+            sign, negative,
+            kc,         990.,      # N/m^(n+1) — terrestrial dry sand
+            kphi,       1528000.,  # N/m^(n+2)
+            n,          1.1,
+            pad radius, 0.15,      # m
+            damping,    1000.;     # N*s/m
+
+    # Output the sinkage and contact force
+    output: joint, 2;
+end: elements;

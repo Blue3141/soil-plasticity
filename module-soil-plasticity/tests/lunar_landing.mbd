@@ -1,0 +1,118 @@
+/*
+ * Test: capsule landing on lunar regolith (loose) — 4-leg configuration
+ *
+ * A 500 kg capsule descends at 3 m/s and lands on 4 legs.
+ * Legs touch down simultaneously (symmetric case).
+ * Each leg has its own BekkerSoilCL instance with independent m_dZmax.
+ *
+ * Lunar gravity: 1.62 m/s^2
+ * Lunar regolith (loose): kc=1400, kphi=820000, n=1.0, pad_radius=0.20 m
+ *
+ * The test verifies:
+ *   1. Landing deceleration profile
+ *   2. Final sinkage per leg (static equilibrium)
+ *   3. Permanent sinkage retained after any bounce
+ *
+ * Usage:
+ *   mbdyn -f lunar_landing.mbd -o lunar_landing
+ */
+
+begin: data;
+    problem: initial value;
+end: data;
+
+begin: initial value;
+    initial time: 0.;
+    final time: 5.;
+    time step: 5.e-4;
+    max iterations: 30;
+    tolerance: 1.e-6;
+    method: ms, 0.6;
+end: initial value;
+
+begin: control data;
+    structural nodes: 5;     # 1 capsule body node + 4 ground nodes
+    rigid bodies: 1;
+    joints: 8;               # 4 ground clamps + 4 soil rod contacts
+    gravity;
+    use: loadable elements, in assembly;
+end: control data;
+
+module load: "libmodule-soil-plasticity";
+
+begin: nodes;
+    # Ground nodes below each leg (fixed via clamp joint)
+    structural node: 1, dynamic, -1., -1., 0., eye, null, null;  # leg 1
+    structural node: 2, dynamic,  1., -1., 0., eye, null, null;  # leg 2
+    structural node: 3, dynamic,  1.,  1., 0., eye, null, null;  # leg 3
+    structural node: 4, dynamic, -1.,  1., 0., eye, null, null;  # leg 4
+
+    # Capsule center-of-mass node
+    # Initial position: 1.5 m above ground (legs extend 1.5 m below CoM)
+    # Initial velocity: 3 m/s downward
+    structural node: 5,
+        dynamic,
+        0., 0., 1.5,        # position [m]
+        eye,
+        0., 0., -3.,        # velocity [m/s] — descending
+        null;
+end: nodes;
+
+begin: elements;
+    gravity: 0., 0., -1., const, 1.62;  # lunar gravity
+
+    # Capsule: 500 kg, approximate inertia for 2 m diameter sphere
+    body: 1,
+        5,
+        500.,
+        null,
+        diag, 200., 200., 200.;
+
+    # Ground clamps
+    joint: 1, clamp, 1, node, node;
+    joint: 2, clamp, 2, node, node;
+    joint: 3, clamp, 3, node, node;
+    joint: 4, clamp, 4, node, node;
+
+    # Soil contacts — one per leg
+    # Natural length = distance from ground node to capsule node at t=0
+    # = sqrt((1^2 + 1^2 + 1.5^2)) = sqrt(1+1+2.25) = sqrt(4.25) ≈ 2.0616 m
+    # Each rod: capsule node (5) <-> respective ground node (1..4)
+
+    joint: 5, rod,
+        5, 1, from nodes,
+        bekker soil,
+            sign, negative,
+            kc, 1400., kphi, 820000., n, 1.0,
+            pad radius, 0.20,
+            damping, 2000.;
+
+    joint: 6, rod,
+        5, 2, from nodes,
+        bekker soil,
+            sign, negative,
+            kc, 1400., kphi, 820000., n, 1.0,
+            pad radius, 0.20,
+            damping, 2000.;
+
+    joint: 7, rod,
+        5, 3, from nodes,
+        bekker soil,
+            sign, negative,
+            kc, 1400., kphi, 820000., n, 1.0,
+            pad radius, 0.20,
+            damping, 2000.;
+
+    joint: 8, rod,
+        5, 4, from nodes,
+        bekker soil,
+            sign, negative,
+            kc, 1400., kphi, 820000., n, 1.0,
+            pad radius, 0.20,
+            damping, 2000.;
+
+    output: joint, 5;
+    output: joint, 6;
+    output: joint, 7;
+    output: joint, 8;
+end: elements;
