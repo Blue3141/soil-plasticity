@@ -28,41 +28,57 @@
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 /*
- * Surface impact element for MBDyn.
+ * Surface impact element for MBDyn — Bekker-Wong plasticity + optional
+ * hydrodynamic contribution.
  *
- * Models the normal reaction force of a planar surface on a set of structural
- * nodes using a hydrodynamic (quadratic velocity) formulation:
+ * ---- Normal force (always active when node is in contact) ----
  *
- *   FNH = ACCA2 * ANOR * VN^2 * tanh(VN / VN0)
+ * 1) Bekker-Wong with elastic-plastic load/unload (MANDATORY):
  *
- * where:
- *   FNH   = normal reaction force [N]
- *   ACCA2 = 0.5 * rho * Cd  (rho = fluid/soil density, Cd = drag coefficient;
- *            for a flat plate orthogonal to flow: Cd = 1.2)
- *   ANOR  = effective contact area [m^2]
- *   VN    = approach velocity normal to the plane (positive = into surface) [m/s]
- *   VN0   = reference velocity for tanh stabilisation (typically 10% of max
- *            expected VN) [m/s]
+ *    Loading   (z >= z_max, virgin or deepening penetration):
+ *      F_BEK = A * (kc/b + kphi) * z^n
  *
- * The tanh factor acts as a smooth sign function: for VN >> VN0 the formula
- * reduces to the standard quadratic drag law FNH = ACCA2*ANOR*VN*|VN|.
- * For VN < 0 (node moving away from surface) tanh is negative and the force
- * tends to zero — no adhesion.
+ *    Unloading / reloading (z < z_max):
+ *      F_BEK = A * Ku * (z - z0)
+ *      Ku  = n * (kc/b + kphi) * z_max^(n-1)   [secant stiffness at z_max]
+ *      z0  = z_max * (1 - 1/n)                  [permanent sinkage offset]
  *
- * Optional static friction resists tangential slip:
- *   F_fric = -mu_s * FNH * (VT / |VT|)
+ *    z_max is the maximum historical penetration, committed per node at each
+ *    converged timestep via AfterConvergence().
  *
- * The element activates only when a node has penetrated the plane
- * (signed distance d = (x - P0).n < 0).
+ * 2) Hydrodynamic (OPTIONAL, keyword "hydrodynamic"):
+ *      FNH = ACCA2 * ANOR * VN^2 * tanh(VN / VN0)
+ *    ACCA2 = 0.5 * rho * Cd  (flat plate: Cd = 1.2)
+ *    VN    = approach velocity normal to plane (positive = into surface)
+ *    VN0   = reference velocity (~10% of max expected VN) for tanh stabilisation
+ *
+ * ---- Total normal force ----
+ *    FN = F_BEK + FNH   (clamped >= 0, no adhesion)
+ *
+ * ---- Coulomb friction (OPTIONAL, keyword "friction") ----
+ *    F_fric = -mu_s * FN * (VT / |VT|)
+ *    where VT is the tangential velocity component.
+ *    Uses the TOTAL normal force FN.
+ *
+ * ---- Plasticity state management ----
+ *    Each listed node has its own z_max (independent crater depth).
+ *    Within each timestep, z_max_trial is updated monotonically in AssRes.
+ *    AfterConvergence() commits z_max_trial to z_max and recomputes
+ *    Ku and z0 for the next step.
  *
  * Input syntax:
  *   user defined: <label>, surface impact,
- *       plane normal, <nx>, <ny>, <nz>,   # outward unit normal
+ *       plane normal, <nx>, <ny>, <nz>,   # outward unit normal (auto-normalised)
  *       plane point,  <px>, <py>, <pz>,   # any point on the plane
- *       ACCA2,  <acca2>,                  # 0.5*rho*Cd [kg/m^3]
- *       area,   <anor>,                   # contact area per node [m^2]
- *       VN0,    <vn0>,                    # reference velocity [m/s]
- *       [ , friction, <mu_s>, ]           # static friction coeff [-]
+ *       kc,         <kc>,                 # Bekker cohesive modulus [N/m^(n+1)]
+ *       kphi,       <kphi>,               # Bekker frictional modulus [N/m^(n+2)]
+ *       n,          <n>,                  # sinkage exponent [-], >= 0.5
+ *       pad radius, <b>,                  # smaller sinkage dimension [m]
+ *       [ , area, <anor>, ]               # contact area [m^2] (default: pi*b^2)
+ *       [ , hydrodynamic,                 # optional block
+ *             ACCA2, <acca2>,             #   0.5*rho*Cd [kg/m^3]
+ *             VN0,   <vn0>,    ]          #   reference velocity [m/s]
+ *       [ , friction, <mu_s>, ]           # Coulomb coefficient [-]
  *       nodes, <N>,                       # number of nodes
  *           <label_1>, ..., <label_N>     # structural node labels
  *       ;
@@ -71,6 +87,12 @@
  *   loadable elements: 1;
  *
  * Registration key: "surface impact"
+ *
+ * Reference Bekker parameters (kc [N/m^(n+1)], kphi [N/m^(n+2)], n):
+ *   Lunar regolith (loose): kc=1400,  kphi=820000,  n=1.0
+ *   Lunar regolith (hard):  kc=5300,  kphi=1740000, n=1.0
+ *   Mars regolith:          kc=800,   kphi=140000,  n=0.9
+ *   Terrestrial dry sand:   kc=990,   kphi=1528000, n=1.1
  */
 
 #include "mbconfig.h"
@@ -83,56 +105,86 @@
 #include "userelem.h"
 #include "strnode.h"
 
+static const doublereal Z_FLOOR = 1.e-9;
+static const doublereal M_PI_L  = 3.14159265358979323846;
+
 /* ========================================================================= */
 class SurfaceImpactElem : public UserDefinedElem {
 private:
-	Vec3       m_Normal;      /* outward unit normal of the plane              */
-	Vec3       m_PlanePoint;  /* a point on the plane                          */
-	doublereal m_dACCA2;      /* 0.5 * rho * Cd [kg/m^3]                      */
-	doublereal m_dANOR;       /* effective contact area [m^2]                  */
-	doublereal m_dVN0;        /* reference velocity for tanh [m/s]             */
-	doublereal m_dMuS;        /* static friction coefficient [-], 0 = no fric  */
+	/* ---- plane ---- */
+	Vec3 m_Normal;
+	Vec3 m_PlanePoint;
 
-	unsigned                         m_nNodes;
-	std::vector<const StructNode *>  m_Nodes;
+	/* ---- Bekker-Wong (mandatory) ---- */
+	doublereal m_dKc;     /* cohesive modulus [N/m^(n+1)] */
+	doublereal m_dKphi;   /* frictional modulus [N/m^(n+2)] */
+	doublereal m_dNbek;   /* sinkage exponent [-] */
+	doublereal m_dB;      /* pad radius / smaller dimension [m] */
+	doublereal m_dANOR;   /* contact area [m^2] */
 
-	/* Force on node i, computed in AssRes — stored for Output */
+	/* ---- hydrodynamic (optional) ---- */
+	bool       m_bHydro;
+	doublereal m_dACCA2;  /* 0.5*rho*Cd [kg/m^3] */
+	doublereal m_dVN0;    /* reference velocity for tanh [m/s] */
+
+	/* ---- friction ---- */
+	doublereal m_dMuS;
+
+	/* ---- nodes ---- */
+	unsigned                        m_nNodes;
+	std::vector<const StructNode *> m_Nodes;
+
+	/* ---- per-node plastic state ---- */
+	std::vector<doublereal> m_dZmax;        /* committed max sinkage [m] */
+	std::vector<doublereal> m_dZmax_trial;  /* trial (grows within timestep) */
+	std::vector<doublereal> m_dKu;          /* unloading stiffness [N/m^(n+1)*m^n] */
+	std::vector<doublereal> m_dZ0;          /* permanent sinkage offset [m] */
+
+	/* ---- output ---- */
 	mutable std::vector<Vec3> m_Forces;
+
+	/* Bekker bearing coefficient */
+	doublereal KBek(void) const { return m_dKc / m_dB + m_dKphi; }
+
+	/* Recompute unloading parameters from a given z_max */
+	void UpdateUnloading(unsigned i, doublereal z_max) {
+		if (z_max > Z_FLOOR) {
+			m_dKu[i] = m_dNbek * KBek() * std::pow(z_max, m_dNbek - 1.0);
+			m_dZ0[i] = z_max * (1.0 - 1.0 / m_dNbek);
+		} else {
+			m_dKu[i] = m_dNbek * KBek() * std::pow(Z_FLOOR, m_dNbek - 1.0);
+			m_dZ0[i] = 0.;
+		}
+	}
 
 public:
 	SurfaceImpactElem(unsigned uLabel, const DofOwner *pDO,
 		DataManager *pDM, MBDynParser& HP);
 	virtual ~SurfaceImpactElem(void);
 
-	/* ---- element type ---- */
 	virtual Elem::Type GetElemType(void) const { return Elem::LOADABLE; }
-
-	/* ---- output ---- */
 	virtual void Output(OutputHandler& OH) const;
 
-	/* ---- workspace sizing ---- */
 	virtual void WorkSpaceDim(integer *piNumRows, integer *piNumCols) const {
-		/* 3 translational DOFs per node, no couples */
 		*piNumRows = 3 * m_nNodes;
 		*piNumCols = 3 * m_nNodes;
 	}
 
-	/* ---- Jacobian ---- */
 	VariableSubMatrixHandler& AssJac(VariableSubMatrixHandler& WorkMat,
 		doublereal dCoef,
 		const VectorHandler& XCurr,
 		const VectorHandler& XPrimeCurr);
 
-	/* ---- residual ---- */
 	SubVectorHandler& AssRes(SubVectorHandler& WorkVec,
 		doublereal dCoef,
 		const VectorHandler& XCurr,
 		const VectorHandler& XPrimeCurr);
 
-	/* ---- private data (none) ---- */
-	virtual unsigned int iGetNumPrivData(void) const { return 0; }
+	/* Commit plastic state after each converged timestep */
+	virtual void AfterConvergence(const VectorHandler& X,
+		const VectorHandler& XP);
 
-	/* ---- connected nodes ---- */
+	virtual unsigned int iGetNumPrivData(void) const { return 0; }
 	virtual int iGetNumConnectedNodes(void) const {
 		return static_cast<int>(m_nNodes);
 	}
@@ -144,47 +196,34 @@ public:
 			connectedNodes[i] = m_Nodes[i];
 		}
 	}
-
-	/* ---- misc required virtuals ---- */
 	virtual void SetValue(DataManager *pDM,
 		VectorHandler& X, VectorHandler& XP,
 		SimulationEntity::Hints *ph) { }
-
 	virtual std::ostream& Restart(std::ostream& out) const;
-
-	/* ---- initial assembly (not used) ---- */
 	virtual unsigned int iGetInitialNumDof(void) const { return 0; }
 	virtual void InitialWorkSpaceDim(
 		integer *piNumRows, integer *piNumCols) const
-	{
-		*piNumRows = 0;
-		*piNumCols = 0;
-	}
+	{ *piNumRows = 0; *piNumCols = 0; }
 	VariableSubMatrixHandler& InitialAssJac(
 		VariableSubMatrixHandler& WorkMat,
 		const VectorHandler& XCurr)
-	{
-		WorkMat.SetNullMatrix();
-		return WorkMat;
-	}
+	{ WorkMat.SetNullMatrix(); return WorkMat; }
 	SubVectorHandler& InitialAssRes(
 		SubVectorHandler& WorkVec,
 		const VectorHandler& XCurr)
-	{
-		WorkVec.ResizeReset(0);
-		return WorkVec;
-	}
+	{ WorkVec.ResizeReset(0); return WorkVec; }
 };
 
 /* ========================================================================= */
-/* Constructor / parser                                                        */
+/* Constructor                                                                 */
 /* ========================================================================= */
 SurfaceImpactElem::SurfaceImpactElem(unsigned uLabel, const DofOwner *pDO,
 	DataManager *pDM, MBDynParser& HP)
 : UserDefinedElem(uLabel, pDO),
 m_Normal(Zero3), m_PlanePoint(Zero3),
-m_dACCA2(0.), m_dANOR(0.), m_dVN0(1.), m_dMuS(0.),
-m_nNodes(0)
+m_dKc(0.), m_dKphi(0.), m_dNbek(1.), m_dB(1.), m_dANOR(0.),
+m_bHydro(false), m_dACCA2(0.), m_dVN0(1.),
+m_dMuS(0.), m_nNodes(0)
 {
 	if (HP.IsKeyWord("help")) {
 		silent_cerr(
@@ -192,19 +231,21 @@ m_nNodes(0)
 			"  user defined: <label>, surface impact,\n"
 			"      plane normal, <nx>, <ny>, <nz>,\n"
 			"      plane point,  <px>, <py>, <pz>,\n"
-			"      ACCA2,  <acca2>,     # 0.5*rho*Cd [kg/m^3]\n"
-			"      area,   <anor>,      # contact area [m^2]\n"
-			"      VN0,    <vn0>,       # reference velocity [m/s]\n"
+			"      kc,         <kc>,\n"
+			"      kphi,       <kphi>,\n"
+			"      n,          <n>,\n"
+			"      pad radius, <b>,\n"
+			"      [ , area, <anor>, ]\n"
+			"      [ , hydrodynamic,\n"
+			"            ACCA2, <acca2>,\n"
+			"            VN0,   <vn0>, ]\n"
 			"      [ , friction, <mu_s>, ]\n"
-			"      nodes, <N>,\n"
-			"          <label_1>, ..., <label_N>;\n"
+			"      nodes, <N>, <label_1>, ..., <label_N>;\n"
 			<< std::endl);
-		if (!HP.IsArg()) {
-			throw NoErr(MBDYN_EXCEPT_ARGS);
-		}
+		if (!HP.IsArg()) throw NoErr(MBDYN_EXCEPT_ARGS);
 	}
 
-	/* -- plane normal -- */
+	/* plane normal */
 	if (!HP.IsKeyWord("plane" "normal")) {
 		silent_cerr("SurfaceImpactElem(" << uLabel
 			<< "): \"plane normal\" expected at line "
@@ -215,13 +256,13 @@ m_nNodes(0)
 	doublereal dNorm = m_Normal.Norm();
 	if (dNorm < std::numeric_limits<doublereal>::epsilon()) {
 		silent_cerr("SurfaceImpactElem(" << uLabel
-			<< "): zero-length normal vector at line "
+			<< "): zero-length normal at line "
 			<< HP.GetLineData() << std::endl);
 		throw ErrGeneric(MBDYN_EXCEPT_ARGS);
 	}
-	m_Normal *= (1.0 / dNorm);   /* normalise */
+	m_Normal *= (1.0 / dNorm);
 
-	/* -- plane point -- */
+	/* plane point */
 	if (!HP.IsKeyWord("plane" "point")) {
 		silent_cerr("SurfaceImpactElem(" << uLabel
 			<< "): \"plane point\" expected at line "
@@ -230,53 +271,112 @@ m_nNodes(0)
 	}
 	m_PlanePoint = HP.GetVec3();
 
-	/* -- ACCA2 -- */
-	if (!HP.IsKeyWord("ACCA2")) {
+	/* kc */
+	if (!HP.IsKeyWord("kc")) {
 		silent_cerr("SurfaceImpactElem(" << uLabel
-			<< "): \"ACCA2\" expected at line "
+			<< "): \"kc\" expected at line "
 			<< HP.GetLineData() << std::endl);
 		throw ErrGeneric(MBDYN_EXCEPT_ARGS);
 	}
-	m_dACCA2 = HP.GetReal();
-	if (m_dACCA2 <= 0.) {
+	m_dKc = HP.GetReal();
+	if (m_dKc < 0.) {
 		silent_cerr("SurfaceImpactElem(" << uLabel
-			<< "): ACCA2 must be positive at line "
-			<< HP.GetLineData() << std::endl);
-		throw ErrGeneric(MBDYN_EXCEPT_ARGS);
-	}
-
-	/* -- area -- */
-	if (!HP.IsKeyWord("area")) {
-		silent_cerr("SurfaceImpactElem(" << uLabel
-			<< "): \"area\" expected at line "
-			<< HP.GetLineData() << std::endl);
-		throw ErrGeneric(MBDYN_EXCEPT_ARGS);
-	}
-	m_dANOR = HP.GetReal();
-	if (m_dANOR <= 0.) {
-		silent_cerr("SurfaceImpactElem(" << uLabel
-			<< "): area must be positive at line "
+			<< "): kc must be >= 0 at line "
 			<< HP.GetLineData() << std::endl);
 		throw ErrGeneric(MBDYN_EXCEPT_ARGS);
 	}
 
-	/* -- VN0 -- */
-	if (!HP.IsKeyWord("VN0")) {
+	/* kphi */
+	if (!HP.IsKeyWord("kphi")) {
 		silent_cerr("SurfaceImpactElem(" << uLabel
-			<< "): \"VN0\" expected at line "
+			<< "): \"kphi\" expected at line "
 			<< HP.GetLineData() << std::endl);
 		throw ErrGeneric(MBDYN_EXCEPT_ARGS);
 	}
-	m_dVN0 = HP.GetReal();
-	if (m_dVN0 <= 0.) {
+	m_dKphi = HP.GetReal();
+	if (m_dKphi <= 0.) {
 		silent_cerr("SurfaceImpactElem(" << uLabel
-			<< "): VN0 must be positive at line "
+			<< "): kphi must be > 0 at line "
 			<< HP.GetLineData() << std::endl);
 		throw ErrGeneric(MBDYN_EXCEPT_ARGS);
 	}
 
-	/* -- friction (optional) -- */
-	m_dMuS = 0.;
+	/* n */
+	if (!HP.IsKeyWord("n")) {
+		silent_cerr("SurfaceImpactElem(" << uLabel
+			<< "): \"n\" expected at line "
+			<< HP.GetLineData() << std::endl);
+		throw ErrGeneric(MBDYN_EXCEPT_ARGS);
+	}
+	m_dNbek = HP.GetReal();
+	if (m_dNbek < 0.5) {
+		silent_cerr("SurfaceImpactElem(" << uLabel
+			<< "): n must be >= 0.5 at line "
+			<< HP.GetLineData() << std::endl);
+		throw ErrGeneric(MBDYN_EXCEPT_ARGS);
+	}
+
+	/* pad radius */
+	if (!HP.IsKeyWord("pad" "radius")) {
+		silent_cerr("SurfaceImpactElem(" << uLabel
+			<< "): \"pad radius\" expected at line "
+			<< HP.GetLineData() << std::endl);
+		throw ErrGeneric(MBDYN_EXCEPT_ARGS);
+	}
+	m_dB = HP.GetReal();
+	if (m_dB <= 0.) {
+		silent_cerr("SurfaceImpactElem(" << uLabel
+			<< "): pad radius must be > 0 at line "
+			<< HP.GetLineData() << std::endl);
+		throw ErrGeneric(MBDYN_EXCEPT_ARGS);
+	}
+
+	/* area (optional, default pi*b^2) */
+	m_dANOR = M_PI_L * m_dB * m_dB;
+	if (HP.IsKeyWord("area")) {
+		m_dANOR = HP.GetReal();
+		if (m_dANOR <= 0.) {
+			silent_cerr("SurfaceImpactElem(" << uLabel
+				<< "): area must be > 0 at line "
+				<< HP.GetLineData() << std::endl);
+			throw ErrGeneric(MBDYN_EXCEPT_ARGS);
+		}
+	}
+
+	/* hydrodynamic block (optional) */
+	if (HP.IsKeyWord("hydrodynamic")) {
+		m_bHydro = true;
+
+		if (!HP.IsKeyWord("ACCA2")) {
+			silent_cerr("SurfaceImpactElem(" << uLabel
+				<< "): \"ACCA2\" expected in hydrodynamic block at line "
+				<< HP.GetLineData() << std::endl);
+			throw ErrGeneric(MBDYN_EXCEPT_ARGS);
+		}
+		m_dACCA2 = HP.GetReal();
+		if (m_dACCA2 <= 0.) {
+			silent_cerr("SurfaceImpactElem(" << uLabel
+				<< "): ACCA2 must be > 0 at line "
+				<< HP.GetLineData() << std::endl);
+			throw ErrGeneric(MBDYN_EXCEPT_ARGS);
+		}
+
+		if (!HP.IsKeyWord("VN0")) {
+			silent_cerr("SurfaceImpactElem(" << uLabel
+				<< "): \"VN0\" expected in hydrodynamic block at line "
+				<< HP.GetLineData() << std::endl);
+			throw ErrGeneric(MBDYN_EXCEPT_ARGS);
+		}
+		m_dVN0 = HP.GetReal();
+		if (m_dVN0 <= 0.) {
+			silent_cerr("SurfaceImpactElem(" << uLabel
+				<< "): VN0 must be > 0 at line "
+				<< HP.GetLineData() << std::endl);
+			throw ErrGeneric(MBDYN_EXCEPT_ARGS);
+		}
+	}
+
+	/* friction (optional) */
 	if (HP.IsKeyWord("friction")) {
 		m_dMuS = HP.GetReal();
 		if (m_dMuS < 0.) {
@@ -287,7 +387,7 @@ m_nNodes(0)
 		}
 	}
 
-	/* -- node list -- */
+	/* node list */
 	if (!HP.IsKeyWord("nodes")) {
 		silent_cerr("SurfaceImpactElem(" << uLabel
 			<< "): \"nodes\" expected at line "
@@ -297,13 +397,17 @@ m_nNodes(0)
 	int nNodes = HP.GetInt();
 	if (nNodes <= 0) {
 		silent_cerr("SurfaceImpactElem(" << uLabel
-			<< "): number of nodes must be positive at line "
+			<< "): number of nodes must be > 0 at line "
 			<< HP.GetLineData() << std::endl);
 		throw ErrGeneric(MBDYN_EXCEPT_ARGS);
 	}
 	m_nNodes = static_cast<unsigned>(nNodes);
 	m_Nodes.resize(m_nNodes);
 	m_Forces.resize(m_nNodes, Zero3);
+	m_dZmax.resize(m_nNodes, 0.);
+	m_dZmax_trial.resize(m_nNodes, 0.);
+	m_dKu.resize(m_nNodes, 0.);
+	m_dZ0.resize(m_nNodes, 0.);
 
 	for (unsigned i = 0; i < m_nNodes; i++) {
 		unsigned uNodeLabel = HP.GetInt();
@@ -316,18 +420,16 @@ m_nNodes(0)
 				<< HP.GetLineData() << std::endl);
 			throw ErrGeneric(MBDYN_EXCEPT_ARGS);
 		}
+		UpdateUnloading(i, 0.);
 	}
 
 	SetOutputFlag(pDM->fReadOutput(HP, Elem::LOADABLE));
 }
 
-SurfaceImpactElem::~SurfaceImpactElem(void)
-{
-	NO_OP;
-}
+SurfaceImpactElem::~SurfaceImpactElem(void) { NO_OP; }
 
 /* ========================================================================= */
-/* AssRes — residual contribution                                              */
+/* AssRes                                                                      */
 /* ========================================================================= */
 SubVectorHandler& SurfaceImpactElem::AssRes(
 	SubVectorHandler& WorkVec,
@@ -344,47 +446,79 @@ SubVectorHandler& SurfaceImpactElem::AssRes(
 		const StructNode *pNode = m_Nodes[i];
 		integer iMomIdx = pNode->iGetFirstMomentumIndex();
 
-		/* row indices for the 3 translational momentum equations */
 		for (integer j = 1; j <= 3; j++) {
 			WorkVec.PutRowIndex(iRow + j - 1, iMomIdx + j);
 		}
 
-		m_Forces[i] = Zero3;   /* default: no contact */
+		m_Forces[i] = Zero3;
 
 		const Vec3& x = pNode->GetXCurr();
 		const Vec3& v = pNode->GetVCurr();
 
-		/* signed distance from plane: positive = above (no contact) */
+		/* signed distance: positive = above plane (no contact) */
 		doublereal d = (x - m_PlanePoint).Dot(m_Normal);
 		if (d >= 0.) {
 			iRow += 3;
 			continue;
 		}
 
-		/* approach velocity: positive = moving into the surface */
-		doublereal VN = -(v.Dot(m_Normal));
+		doublereal z = -d;   /* penetration depth >= 0 */
 
-		/* normal force magnitude — tanh smooths VN*|VN| around zero */
-		doublereal th  = std::tanh(VN / m_dVN0);
-		doublereal FNH = m_dACCA2 * m_dANOR * VN * VN * th;
+		/* ---- Bekker-Wong (mandatory, with plasticity) ---- */
 
-		/* no adhesion: clamp negative force to zero */
-		if (FNH < 0.) {
-			FNH = 0.;
+		/* Update trial z_max monotonically within the timestep.
+		 * Uses committed m_dZmax to decide the branch — trial only grows. */
+		if (z > m_dZmax_trial[i]) {
+			m_dZmax_trial[i] = z;
 		}
 
-		/* normal force vector: pushes node away from surface (+n direction) */
-		Vec3 F_total = m_Normal * FNH;
+		doublereal F_BEK, dFBEK_dz;
 
-		/* tangential friction */
-		if (m_dMuS > 0. && FNH > 0.) {
+		if (z >= m_dZmax[i]) {
+			/* Loading branch: virgin or deeper penetration */
+			doublereal z_safe = std::max(z, Z_FLOOR);
+			F_BEK    = m_dANOR * KBek() * std::pow(z_safe, m_dNbek);
+			dFBEK_dz = m_dANOR * KBek() * m_dNbek
+			         * std::pow(z_safe, m_dNbek - 1.0);
+		} else {
+			/* Unloading/reloading branch: elastic from committed z_max */
+			doublereal dz = z - m_dZ0[i];
+			if (dz < 0.) dz = 0.;   /* no adhesion */
+			F_BEK    = m_dANOR * m_dKu[i] * dz;
+			dFBEK_dz = m_dANOR * m_dKu[i];
+		}
+
+		/* ---- Hydrodynamic (optional) ---- */
+		doublereal FNH    = 0.;
+		doublereal dFNH_dVN = 0.;
+
+		if (m_bHydro) {
+			doublereal VN  = -(v.Dot(m_Normal));
+			doublereal th  = std::tanh(VN / m_dVN0);
+			doublereal sech2 = 1.0 - th * th;
+			FNH     = m_dACCA2 * m_dANOR * VN * VN * th;
+			if (FNH < 0.) FNH = 0.;
+			dFNH_dVN = m_dACCA2 * m_dANOR
+			         * VN * (2.0 * th + (VN / m_dVN0) * sech2);
+			if (dFNH_dVN < 0.) dFNH_dVN = 0.;
+		}
+
+		/* ---- Total normal force ---- */
+		doublereal FN = F_BEK + FNH;
+		if (FN < 0.) FN = 0.;
+
+		/* Store dFBEK_dz and dFNH_dVN for AssJac — recomputed there */
+		(void)dFBEK_dz; (void)dFNH_dVN;   /* computed fresh in AssJac */
+
+		Vec3 F_total = m_Normal * FN;
+
+		/* ---- Coulomb friction on total FN ---- */
+		if (m_dMuS > 0. && FN > 0.) {
 			doublereal vdotn = v.Dot(m_Normal);
 			Vec3 VT_vec = v - m_Normal * vdotn;
 			doublereal VT_mag = VT_vec.Norm();
-
 			if (VT_mag > 1.e-12) {
-				/* static friction opposes tangential motion */
-				F_total += VT_vec * (-m_dMuS * FNH / VT_mag);
+				F_total += VT_vec * (-m_dMuS * FN / VT_mag);
 			}
 		}
 
@@ -397,18 +531,25 @@ SubVectorHandler& SurfaceImpactElem::AssRes(
 }
 
 /* ========================================================================= */
-/* AssJac — Jacobian contribution                                              */
+/* AssJac                                                                      */
 /* ========================================================================= */
 /*
- * The normal force depends on the approach velocity VN = -(v·n).
+ * Jacobian contributions (rows = momentum idx, cols = position idx):
  *
- * dFNH/dVN = ACCA2 * ANOR * VN * (2*tanh + VN/VN0 * (1 - tanh^2))
+ *  Loading branch:
+ *    dF_BEK/dx = -dCoef * ANOR*KBek*n*z^(n-1) * n⊗n
  *
- * Jacobian of the force vector w.r.t. velocity (3x3, per node):
- *   dF_normal/dv = -(dFNH/dVN) * (n ⊗ n)
+ *  Unloading branch:
+ *    dF_BEK/dx = -dCoef * ANOR*Ku * n⊗n
  *
- * This is negative-semidefinite (damping-like), which is stabilising.
- * The friction Jacobian is omitted (approximation acceptable for convergence).
+ *  Hydrodynamic (if enabled, no dCoef):
+ *    dFNH/dv = -(dFNH/dVN) * n⊗n
+ *    dFNH/dVN = ACCA2*ANOR*VN*(2*tanh + VN/VN0*sech^2)
+ *
+ *  Combined: J_jk = Jnn * n_j * n_k
+ *    Jnn = -(dCoef * dFBEK/dz + dFNH/dVN)
+ *
+ * Friction Jacobian omitted (approximation).
  */
 VariableSubMatrixHandler& SurfaceImpactElem::AssJac(
 	VariableSubMatrixHandler& WorkMat,
@@ -442,27 +583,42 @@ VariableSubMatrixHandler& SurfaceImpactElem::AssJac(
 			continue;
 		}
 
-		doublereal VN    = -(v.Dot(m_Normal));
-		doublereal th    = std::tanh(VN / m_dVN0);
-		doublereal sech2 = 1.0 - th * th;
+		doublereal z = -d;
 
-		/* dFNH/dVN: derivative of normal force magnitude w.r.t. approach velocity */
-		doublereal dFdVN = m_dACCA2 * m_dANOR
-			* VN * (2.0 * th + (VN / m_dVN0) * sech2);
-		if (dFdVN < 0.) dFdVN = 0.;
+		/* Bekker stiffness (position-dependent, with dCoef) */
+		doublereal dFBEK_dz;
+		if (z >= m_dZmax[i]) {
+			doublereal z_safe = std::max(z, Z_FLOOR);
+			dFBEK_dz = m_dANOR * KBek()
+				* m_dNbek * std::pow(z_safe, m_dNbek - 1.0);
+		} else {
+			dFBEK_dz = m_dANOR * m_dKu[i];
+		}
+
+		/* Hydrodynamic damping (velocity-dependent, no dCoef) */
+		doublereal dFNH_dVN = 0.;
+		if (m_bHydro) {
+			doublereal VN    = -(v.Dot(m_Normal));
+			doublereal th    = std::tanh(VN / m_dVN0);
+			doublereal sech2 = 1.0 - th * th;
+			dFNH_dVN = m_dACCA2 * m_dANOR
+				* VN * (2.0 * th + (VN / m_dVN0) * sech2);
+			if (dFNH_dVN < 0.) dFNH_dVN = 0.;
+		}
 
 		/*
-		 * Velocity Jacobian (no dCoef factor):
-		 *   dF_normal_j / dv_k = -(dFNH/dVN) * n_j * n_k
-		 *
-		 * Converted to position Jacobian via xp = (x - x_old)/dCoef:
-		 *   dF/dx_k = (dF/dv_k) / dCoef
-		 * In AssJac we add dCoef * dF/dx = dF/dv — so NO dCoef factor here.
+		 * z = -d = -(x-P0)·n  →  dz/dx_k = -n_k
+		 * dF_BEK_j/dx_k = dF_BEK/dz * dz/dx_k * n_j = -dFBEK_dz * n_k * n_j
+		 * VN = -(v·n)        →  dVN/dv_k = -n_k
+		 * dFNH_j/dv_k       = dFNH/dVN * dVN/dv_k * n_j = -dFNH_dVN * n_k * n_j
+		 * Combined Jnn (negative): -(dCoef*dFBEK_dz + dFNH_dVN)
 		 */
+		doublereal Jnn = -(dCoef * dFBEK_dz + dFNH_dVN);
+
 		for (integer j = 1; j <= 3; j++) {
 			for (integer k = 1; k <= 3; k++) {
 				WM.IncCoef(iRow + j - 1, iRow + k - 1,
-					-dFdVN * m_Normal(j) * m_Normal(k));
+					Jnn * m_Normal(j) * m_Normal(k));
 			}
 		}
 
@@ -470,6 +626,23 @@ VariableSubMatrixHandler& SurfaceImpactElem::AssJac(
 	}
 
 	return WorkMat;
+}
+
+/* ========================================================================= */
+/* AfterConvergence — commit plastic state per node                           */
+/* ========================================================================= */
+void SurfaceImpactElem::AfterConvergence(
+	const VectorHandler& /* X */,
+	const VectorHandler& /* XP */)
+{
+	for (unsigned i = 0; i < m_nNodes; i++) {
+		if (m_dZmax_trial[i] > m_dZmax[i]) {
+			m_dZmax[i] = m_dZmax_trial[i];
+			UpdateUnloading(i, m_dZmax[i]);
+		}
+		/* Reset trial to committed value for next timestep */
+		m_dZmax_trial[i] = m_dZmax[i];
+	}
 }
 
 /* ========================================================================= */
@@ -496,10 +669,17 @@ std::ostream& SurfaceImpactElem::Restart(std::ostream& out) const
 	out << "user defined: " << GetLabel() << ", surface impact"
 		<< ", plane normal, " << m_Normal
 		<< ", plane point, "  << m_PlanePoint
-		<< ", ACCA2, "  << m_dACCA2
-		<< ", area, "   << m_dANOR
-		<< ", VN0, "    << m_dVN0
-		<< ", friction, " << m_dMuS
+		<< ", kc, "         << m_dKc
+		<< ", kphi, "       << m_dKphi
+		<< ", n, "          << m_dNbek
+		<< ", pad radius, " << m_dB
+		<< ", area, "       << m_dANOR;
+	if (m_bHydro) {
+		out << ", hydrodynamic"
+			<< ", ACCA2, " << m_dACCA2
+			<< ", VN0, "   << m_dVN0;
+	}
+	out << ", friction, " << m_dMuS
 		<< ", nodes, " << m_nNodes;
 	for (unsigned i = 0; i < m_nNodes; i++) {
 		out << ", " << m_Nodes[i]->GetLabel();
