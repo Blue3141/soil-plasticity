@@ -28,421 +28,505 @@
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 /*
- * Bekker-Wong soil plasticity constitutive law for MBDyn.
+ * Surface impact element for MBDyn.
  *
- * Models terrain behavior during spacecraft/capsule landing using the
- * modified Bekker-Wong pressure-sinkage law with elastic unloading.
- * Suitable for granular soils: lunar/Martian regolith, terrestrial sand.
+ * Models the normal reaction force of a planar surface on a set of structural
+ * nodes using a hydrodynamic (quadratic velocity) formulation:
  *
- * Loading branch (z >= z_max, virgin loading or deeper penetration):
- *   F = A * (kc/b + kphi) * z^n
+ *   FNH = ACCA2 * ANOR * VN^2 * tanh(VN / VN0)
  *
- * Unloading/reloading branch (z < z_max):
- *   F = A * Ku * (z - z0)
- *   Ku = n * (kc/b + kphi) * z_max^(n-1)   [secant stiffness at z_max]
- *   z0 = z_max * (1 - 1/n)                  [permanent sinkage offset]
+ * where:
+ *   FNH   = normal reaction force [N]
+ *   ACCA2 = 0.5 * rho * Cd  (rho = fluid/soil density, Cd = drag coefficient;
+ *            for a flat plate orthogonal to flow: Cd = 1.2)
+ *   ANOR  = effective contact area [m^2]
+ *   VN    = approach velocity normal to the plane (positive = into surface) [m/s]
+ *   VN0   = reference velocity for tanh stabilisation (typically 10% of max
+ *            expected VN) [m/s]
  *
- * Viscous damping (stabilizes impact transient):
- *   F_total = F_Bekker + c_damp * dz/dt
+ * The tanh factor acts as a smooth sign function: for VN >> VN0 the formula
+ * reduces to the standard quadratic drag law FNH = ACCA2*ANOR*VN*|VN|.
+ * For VN < 0 (node moving away from surface) tanh is negative and the force
+ * tends to zero — no adhesion.
  *
- * Intended usage: pair with a Rod joint between the capsule leg-tip node
- * and a fixed ground node. One instance per leg — each tracks its own
- * permanent sinkage independently.
+ * Optional static friction resists tangential slip:
+ *   F_fric = -mu_s * FNH * (VT / |VT|)
  *
- * Reference parameters (Bekker 1960, Wong 2008):
- *   Lunar regolith (loose): kc=1400, kphi=820000, n=1.0
- *   Lunar regolith (hard):  kc=5300, kphi=1740000, n=1.0
- *   Mars regolith:          kc=800,  kphi=140000,  n=0.9
- *   Terrestrial dry sand:   kc=990,  kphi=1528000, n=1.1
+ * The element activates only when a node has penetrated the plane
+ * (signed distance d = (x - P0).n < 0).
  *
  * Input syntax:
- *   constitutive law: <label>, 1D, bekker soil,
- *       [ , sign, { positive | negative | <real> }, ]
- *       kc, <kc>,           # cohesive modulus [N/m^(n+1)]
- *       kphi, <kphi>,       # frictional modulus [N/m^(n+2)]
- *       n, <n>,             # sinkage exponent [-], >= 0.5
- *       pad radius, <b>,    # effective contact radius [m]
- *       [ , pad area, <A>, ]  # override area (default: pi*b^2)
- *       damping, <c_damp>,  # viscous damping [N*s/m], >= 0
- *       [ , initial zmax, <z_max0>, ]   # restore plastic state on restart
- *       [ , prestrain, (DriveCaller)<prestrain> ]
+ *   user defined: <label>, surface impact,
+ *       plane normal, <nx>, <ny>, <nz>,   # outward unit normal
+ *       plane point,  <px>, <py>, <pz>,   # any point on the plane
+ *       ACCA2,  <acca2>,                  # 0.5*rho*Cd [kg/m^3]
+ *       area,   <anor>,                   # contact area per node [m^2]
+ *       VN0,    <vn0>,                    # reference velocity [m/s]
+ *       [ , friction, <mu_s>, ]           # static friction coeff [-]
+ *       nodes, <N>,                       # number of nodes
+ *           <label_1>, ..., <label_N>     # structural node labels
  *       ;
+ *
+ * In control data:
+ *   loadable elements: 1;
+ *
+ * Registration key: "surface impact"
  */
 
-#include "mbconfig.h"           /* This goes first in every *.c,*.cc file */
+#include "mbconfig.h"
 
 #include <cmath>
-#include <cfloat>
-#include <algorithm>
+#include <limits>
+#include <vector>
 
 #include "dataman.h"
-#include "constltp_impl.h"
+#include "userelem.h"
+#include "strnode.h"
 
-static const doublereal Z_FLOOR = 1.e-9;   /* sinkage floor [m] — avoids pow(0, n-1) */
-static const doublereal M_PI_LOCAL = 3.14159265358979323846;
-
-class BekkerSoilCL
-: public ElasticConstitutiveLaw<doublereal, doublereal> {
+/* ========================================================================= */
+class SurfaceImpactElem : public UserDefinedElem {
 private:
-	/* Bekker-Wong soil parameters */
-	doublereal m_dKc;       /* cohesive modulus [N/m^(n+1)]  */
-	doublereal m_dKphi;     /* frictional modulus [N/m^(n+2)] */
-	doublereal m_dN;        /* sinkage exponent [-]           */
-	doublereal m_dB;        /* effective pad radius [m]       */
-	doublereal m_dA;        /* effective contact area [m^2]   */
-	doublereal m_dCdamp;    /* viscous damping [N*s/m]        */
+	Vec3       m_Normal;      /* outward unit normal of the plane              */
+	Vec3       m_PlanePoint;  /* a point on the plane                          */
+	doublereal m_dACCA2;      /* 0.5 * rho * Cd [kg/m^3]                      */
+	doublereal m_dANOR;       /* effective contact area [m^2]                  */
+	doublereal m_dVN0;        /* reference velocity for tanh [m/s]             */
+	doublereal m_dMuS;        /* static friction coefficient [-], 0 = no fric  */
 
-	/* Sign convention: z = m_dSign * Epsilon (z > 0 means penetrating) */
-	doublereal m_dSign;
+	unsigned                         m_nNodes;
+	std::vector<const StructNode *>  m_Nodes;
 
-	/* Plastic state — committed only in AfterConvergence() */
-	doublereal m_dZmax;       /* maximum historical sinkage (committed) [m] */
-	doublereal m_dZmax_trial; /* trial z_max accumulated during Newton-Raphson */
-	doublereal m_dKu;         /* unloading stiffness [N/m] cached from z_max */
-	doublereal m_dZ0;         /* permanent sinkage offset [m] cached from z_max */
-
-	/* Contact state toggling (same pattern as HuntCrossleyCL) */
-	bool m_bActive;
-	bool m_bToggling;
-
-	/* Precompute Bekker coefficient: K_bek = kc/b + kphi */
-	doublereal KBek(void) const {
-		return m_dKc / m_dB + m_dKphi;
-	}
-
-	/* Update cached unloading parameters from a given z_max value */
-	void UpdateUnloadingCache(doublereal z_max) {
-		if (z_max > Z_FLOOR) {
-			m_dKu = m_dN * KBek() * std::pow(z_max, m_dN - 1.0);
-			m_dZ0 = z_max - (m_dA * KBek() * std::pow(z_max, m_dN))
-			              / (m_dA * m_dKu);
-			/* Simplification: z0 = z_max*(1 - 1/n) for pure power law.
-			 * The formula above is equivalent but numerically stable for
-			 * any n >= 0.5. */
-		} else {
-			/* z_max too small: treat as elastic regime with tiny stiffness */
-			m_dKu = m_dN * KBek() * std::pow(Z_FLOOR, m_dN - 1.0);
-			m_dZ0 = 0.0;
-		}
-	}
+	/* Force on node i, computed in AssRes — stored for Output */
+	mutable std::vector<Vec3> m_Forces;
 
 public:
-	BekkerSoilCL(const TplDriveCaller<doublereal> *pTplDC,
-		doublereal dSign,
-		doublereal dKc, doublereal dKphi, doublereal dN,
-		doublereal dB, doublereal dA,
-		doublereal dCdamp,
-		doublereal dZmax0)
-	: ElasticConstitutiveLaw<doublereal, doublereal>(pTplDC, 0.),
-	m_dKc(dKc), m_dKphi(dKphi), m_dN(dN),
-	m_dB(dB), m_dA(dA), m_dCdamp(dCdamp),
-	m_dSign(dSign),
-	m_dZmax(dZmax0), m_dZmax_trial(dZmax0),
-	m_dKu(0.), m_dZ0(0.),
-	m_bActive(false), m_bToggling(false)
+	SurfaceImpactElem(unsigned uLabel, const DofOwner *pDO,
+		DataManager *pDM, MBDynParser& HP);
+	virtual ~SurfaceImpactElem(void);
+
+	/* ---- element type ---- */
+	virtual Elem::Type GetElemType(void) const { return Elem::LOADABLE; }
+
+	/* ---- output ---- */
+	virtual void Output(OutputHandler& OH) const;
+
+	/* ---- workspace sizing ---- */
+	virtual void WorkSpaceDim(integer *piNumRows, integer *piNumCols) const {
+		/* 3 translational DOFs per node, no couples */
+		*piNumRows = 3 * m_nNodes;
+		*piNumCols = 3 * m_nNodes;
+	}
+
+	/* ---- Jacobian ---- */
+	VariableSubMatrixHandler& AssJac(VariableSubMatrixHandler& WorkMat,
+		doublereal dCoef,
+		const VectorHandler& XCurr,
+		const VectorHandler& XPrimeCurr);
+
+	/* ---- residual ---- */
+	SubVectorHandler& AssRes(SubVectorHandler& WorkVec,
+		doublereal dCoef,
+		const VectorHandler& XCurr,
+		const VectorHandler& XPrimeCurr);
+
+	/* ---- private data (none) ---- */
+	virtual unsigned int iGetNumPrivData(void) const { return 0; }
+
+	/* ---- connected nodes ---- */
+	virtual int iGetNumConnectedNodes(void) const {
+		return static_cast<int>(m_nNodes);
+	}
+	virtual void GetConnectedNodes(
+		std::vector<const Node *>& connectedNodes) const
 	{
-		UpdateUnloadingCache(m_dZmax);
-	};
+		connectedNodes.resize(m_nNodes);
+		for (unsigned i = 0; i < m_nNodes; i++) {
+			connectedNodes[i] = m_Nodes[i];
+		}
+	}
 
-	virtual ~BekkerSoilCL(void) {
-		NO_OP;
-	};
+	/* ---- misc required virtuals ---- */
+	virtual void SetValue(DataManager *pDM,
+		VectorHandler& X, VectorHandler& XP,
+		SimulationEntity::Hints *ph) { }
 
-	virtual ConstLawType::Type GetConstLawType(void) const {
-		/* VISCOELASTIC because Update() uses both Eps and EpsPrime */
-		return ConstLawType::VISCOELASTIC;
-	};
+	virtual std::ostream& Restart(std::ostream& out) const;
 
-	virtual ConstitutiveLaw<doublereal, doublereal>* pCopy(void) const {
-		ConstitutiveLaw<doublereal, doublereal>* pCL = 0;
+	/* ---- initial assembly (not used) ---- */
+	virtual unsigned int iGetInitialNumDof(void) const { return 0; }
+	virtual void InitialWorkSpaceDim(
+		integer *piNumRows, integer *piNumCols) const
+	{
+		*piNumRows = 0;
+		*piNumCols = 0;
+	}
+	VariableSubMatrixHandler& InitialAssJac(
+		VariableSubMatrixHandler& WorkMat,
+		const VectorHandler& XCurr)
+	{
+		WorkMat.SetNullMatrix();
+		return WorkMat;
+	}
+	SubVectorHandler& InitialAssRes(
+		SubVectorHandler& WorkVec,
+		const VectorHandler& XCurr)
+	{
+		WorkVec.ResizeReset(0);
+		return WorkVec;
+	}
+};
 
-		SAFENEWWITHCONSTRUCTOR(pCL, BekkerSoilCL,
-			BekkerSoilCL(pGetDriveCaller()->pCopy(),
-				m_dSign,
-				m_dKc, m_dKphi, m_dN,
-				m_dB, m_dA,
-				m_dCdamp,
-				m_dZmax));  /* copy current plastic state */
-		return pCL;
-	};
+/* ========================================================================= */
+/* Constructor / parser                                                        */
+/* ========================================================================= */
+SurfaceImpactElem::SurfaceImpactElem(unsigned uLabel, const DofOwner *pDO,
+	DataManager *pDM, MBDynParser& HP)
+: UserDefinedElem(uLabel, pDO),
+m_Normal(Zero3), m_PlanePoint(Zero3),
+m_dACCA2(0.), m_dANOR(0.), m_dVN0(1.), m_dMuS(0.),
+m_nNodes(0)
+{
+	if (HP.IsKeyWord("help")) {
+		silent_cerr(
+			"SurfaceImpactElem:\n"
+			"  user defined: <label>, surface impact,\n"
+			"      plane normal, <nx>, <ny>, <nz>,\n"
+			"      plane point,  <px>, <py>, <pz>,\n"
+			"      ACCA2,  <acca2>,     # 0.5*rho*Cd [kg/m^3]\n"
+			"      area,   <anor>,      # contact area [m^2]\n"
+			"      VN0,    <vn0>,       # reference velocity [m/s]\n"
+			"      [ , friction, <mu_s>, ]\n"
+			"      nodes, <N>,\n"
+			"          <label_1>, ..., <label_N>;\n"
+			<< std::endl);
+		if (!HP.IsArg()) {
+			throw NoErr(MBDYN_EXCEPT_ARGS);
+		}
+	}
 
-	virtual std::ostream& Restart(std::ostream& out) const {
-		out << "bekker soil"
-			<< ", sign, "        << m_dSign
-			<< ", kc, "          << m_dKc
-			<< ", kphi, "        << m_dKphi
-			<< ", n, "           << m_dN
-			<< ", pad radius, "  << m_dB
-			<< ", pad area, "    << m_dA
-			<< ", damping, "     << m_dCdamp
-			<< ", initial zmax, "<< m_dZmax  /* preserve plastic state on restart */
-			<< ", ";
-		ElasticConstitutiveLaw<doublereal, doublereal>::Restart_int(out);
-		return out;
-	};
+	/* -- plane normal -- */
+	if (!HP.IsKeyWord("plane" "normal")) {
+		silent_cerr("SurfaceImpactElem(" << uLabel
+			<< "): \"plane normal\" expected at line "
+			<< HP.GetLineData() << std::endl);
+		throw ErrGeneric(MBDYN_EXCEPT_ARGS);
+	}
+	m_Normal = HP.GetVec3();
+	doublereal dNorm = m_Normal.Norm();
+	if (dNorm < std::numeric_limits<doublereal>::epsilon()) {
+		silent_cerr("SurfaceImpactElem(" << uLabel
+			<< "): zero-length normal vector at line "
+			<< HP.GetLineData() << std::endl);
+		throw ErrGeneric(MBDYN_EXCEPT_ARGS);
+	}
+	m_Normal *= (1.0 / dNorm);   /* normalise */
 
-	virtual void Update(const doublereal& Eps, const doublereal& EpsPrime) {
-		/* Strain relative to prestrain drive */
-		ConstitutiveLaw<doublereal, doublereal>::Epsilon =
-			Eps - ElasticConstitutiveLaw<doublereal, doublereal>::Get();
-		ConstitutiveLaw<doublereal, doublereal>::EpsilonPrime = EpsPrime;
+	/* -- plane point -- */
+	if (!HP.IsKeyWord("plane" "point")) {
+		silent_cerr("SurfaceImpactElem(" << uLabel
+			<< "): \"plane point\" expected at line "
+			<< HP.GetLineData() << std::endl);
+		throw ErrGeneric(MBDYN_EXCEPT_ARGS);
+	}
+	m_PlanePoint = HP.GetVec3();
 
-		/* Sinkage: z > 0 means the leg is penetrating the soil */
-		doublereal z  = m_dSign * ConstitutiveLaw<doublereal, doublereal>::Epsilon;
-		doublereal zp = m_dSign * ConstitutiveLaw<doublereal, doublereal>::EpsilonPrime;
+	/* -- ACCA2 -- */
+	if (!HP.IsKeyWord("ACCA2")) {
+		silent_cerr("SurfaceImpactElem(" << uLabel
+			<< "): \"ACCA2\" expected at line "
+			<< HP.GetLineData() << std::endl);
+		throw ErrGeneric(MBDYN_EXCEPT_ARGS);
+	}
+	m_dACCA2 = HP.GetReal();
+	if (m_dACCA2 <= 0.) {
+		silent_cerr("SurfaceImpactElem(" << uLabel
+			<< "): ACCA2 must be positive at line "
+			<< HP.GetLineData() << std::endl);
+		throw ErrGeneric(MBDYN_EXCEPT_ARGS);
+	}
 
-		/* ---- No contact: leg above ground ---- */
-		if (z <= 0.) {
-			if (m_bActive && !m_bToggling) {
-				m_bToggling = true;   /* will deactivate at AfterConvergence */
+	/* -- area -- */
+	if (!HP.IsKeyWord("area")) {
+		silent_cerr("SurfaceImpactElem(" << uLabel
+			<< "): \"area\" expected at line "
+			<< HP.GetLineData() << std::endl);
+		throw ErrGeneric(MBDYN_EXCEPT_ARGS);
+	}
+	m_dANOR = HP.GetReal();
+	if (m_dANOR <= 0.) {
+		silent_cerr("SurfaceImpactElem(" << uLabel
+			<< "): area must be positive at line "
+			<< HP.GetLineData() << std::endl);
+		throw ErrGeneric(MBDYN_EXCEPT_ARGS);
+	}
+
+	/* -- VN0 -- */
+	if (!HP.IsKeyWord("VN0")) {
+		silent_cerr("SurfaceImpactElem(" << uLabel
+			<< "): \"VN0\" expected at line "
+			<< HP.GetLineData() << std::endl);
+		throw ErrGeneric(MBDYN_EXCEPT_ARGS);
+	}
+	m_dVN0 = HP.GetReal();
+	if (m_dVN0 <= 0.) {
+		silent_cerr("SurfaceImpactElem(" << uLabel
+			<< "): VN0 must be positive at line "
+			<< HP.GetLineData() << std::endl);
+		throw ErrGeneric(MBDYN_EXCEPT_ARGS);
+	}
+
+	/* -- friction (optional) -- */
+	m_dMuS = 0.;
+	if (HP.IsKeyWord("friction")) {
+		m_dMuS = HP.GetReal();
+		if (m_dMuS < 0.) {
+			silent_cerr("SurfaceImpactElem(" << uLabel
+				<< "): friction must be >= 0 at line "
+				<< HP.GetLineData() << std::endl);
+			throw ErrGeneric(MBDYN_EXCEPT_ARGS);
+		}
+	}
+
+	/* -- node list -- */
+	if (!HP.IsKeyWord("nodes")) {
+		silent_cerr("SurfaceImpactElem(" << uLabel
+			<< "): \"nodes\" expected at line "
+			<< HP.GetLineData() << std::endl);
+		throw ErrGeneric(MBDYN_EXCEPT_ARGS);
+	}
+	int nNodes = HP.GetInt();
+	if (nNodes <= 0) {
+		silent_cerr("SurfaceImpactElem(" << uLabel
+			<< "): number of nodes must be positive at line "
+			<< HP.GetLineData() << std::endl);
+		throw ErrGeneric(MBDYN_EXCEPT_ARGS);
+	}
+	m_nNodes = static_cast<unsigned>(nNodes);
+	m_Nodes.resize(m_nNodes);
+	m_Forces.resize(m_nNodes, Zero3);
+
+	for (unsigned i = 0; i < m_nNodes; i++) {
+		unsigned uNodeLabel = HP.GetInt();
+		m_Nodes[i] = dynamic_cast<const StructNode *>(
+			pDM->pFindNode(Node::STRUCTURAL, uNodeLabel));
+		if (!m_Nodes[i]) {
+			silent_cerr("SurfaceImpactElem(" << uLabel
+				<< "): structural node " << uNodeLabel
+				<< " not found at line "
+				<< HP.GetLineData() << std::endl);
+			throw ErrGeneric(MBDYN_EXCEPT_ARGS);
+		}
+	}
+
+	SetOutputFlag(pDM->fReadOutput(HP, Elem::LOADABLE));
+}
+
+SurfaceImpactElem::~SurfaceImpactElem(void)
+{
+	NO_OP;
+}
+
+/* ========================================================================= */
+/* AssRes — residual contribution                                              */
+/* ========================================================================= */
+SubVectorHandler& SurfaceImpactElem::AssRes(
+	SubVectorHandler& WorkVec,
+	doublereal /* dCoef */,
+	const VectorHandler& /* XCurr */,
+	const VectorHandler& /* XPrimeCurr */)
+{
+	integer iNumRows, iNumCols;
+	WorkSpaceDim(&iNumRows, &iNumCols);
+	WorkVec.ResizeReset(iNumRows);
+
+	integer iRow = 1;
+	for (unsigned i = 0; i < m_nNodes; i++) {
+		const StructNode *pNode = m_Nodes[i];
+		integer iMomIdx = pNode->iGetFirstMomentumIndex();
+
+		/* row indices for the 3 translational momentum equations */
+		for (integer j = 1; j <= 3; j++) {
+			WorkVec.PutRowIndex(iRow + j - 1, iMomIdx + j);
+		}
+
+		m_Forces[i] = Zero3;   /* default: no contact */
+
+		const Vec3& x = pNode->GetXCurr();
+		const Vec3& v = pNode->GetVCurr();
+
+		/* signed distance from plane: positive = above (no contact) */
+		doublereal d = (x - m_PlanePoint).Dot(m_Normal);
+		if (d >= 0.) {
+			iRow += 3;
+			continue;
+		}
+
+		/* approach velocity: positive = moving into the surface */
+		doublereal VN = -(v.Dot(m_Normal));
+
+		/* normal force magnitude — tanh smooths VN*|VN| around zero */
+		doublereal th  = std::tanh(VN / m_dVN0);
+		doublereal FNH = m_dACCA2 * m_dANOR * VN * VN * th;
+
+		/* no adhesion: clamp negative force to zero */
+		if (FNH < 0.) {
+			FNH = 0.;
+		}
+
+		/* normal force vector: pushes node away from surface (+n direction) */
+		Vec3 F_total = m_Normal * FNH;
+
+		/* tangential friction */
+		if (m_dMuS > 0. && FNH > 0.) {
+			doublereal vdotn = v.Dot(m_Normal);
+			Vec3 VT_vec = v - m_Normal * vdotn;
+			doublereal VT_mag = VT_vec.Norm();
+
+			if (VT_mag > 1.e-12) {
+				/* static friction opposes tangential motion */
+				F_total += VT_vec * (-m_dMuS * FNH / VT_mag);
 			}
-			ConstitutiveLaw<doublereal, doublereal>::F        = 0.;
-			ConstitutiveLaw<doublereal, doublereal>::FDE      = 0.;
-			ConstitutiveLaw<doublereal, doublereal>::FDEPrime = 0.;
-			return;
 		}
 
-		/* ---- Contact active ---- */
-		if (!m_bActive && !m_bToggling) {
-			m_bToggling = true;       /* will activate at AfterConvergence */
+		m_Forces[i] = F_total;
+		WorkVec.Add(iRow, F_total);
+		iRow += 3;
+	}
+
+	return WorkVec;
+}
+
+/* ========================================================================= */
+/* AssJac — Jacobian contribution                                              */
+/* ========================================================================= */
+/*
+ * The normal force depends on the approach velocity VN = -(v·n).
+ *
+ * dFNH/dVN = ACCA2 * ANOR * VN * (2*tanh + VN/VN0 * (1 - tanh^2))
+ *
+ * Jacobian of the force vector w.r.t. velocity (3x3, per node):
+ *   dF_normal/dv = -(dFNH/dVN) * (n ⊗ n)
+ *
+ * This is negative-semidefinite (damping-like), which is stabilising.
+ * The friction Jacobian is omitted (approximation acceptable for convergence).
+ */
+VariableSubMatrixHandler& SurfaceImpactElem::AssJac(
+	VariableSubMatrixHandler& WorkMat,
+	doublereal dCoef,
+	const VectorHandler& /* XCurr */,
+	const VectorHandler& /* XPrimeCurr */)
+{
+	FullSubMatrixHandler& WM = WorkMat.SetFull();
+
+	integer iNumRows, iNumCols;
+	WorkSpaceDim(&iNumRows, &iNumCols);
+	WM.ResizeReset(iNumRows, iNumCols);
+
+	integer iRow = 1;
+	for (unsigned i = 0; i < m_nNodes; i++) {
+		const StructNode *pNode = m_Nodes[i];
+		integer iMomIdx = pNode->iGetFirstMomentumIndex();
+		integer iPosIdx = pNode->iGetFirstPositionIndex();
+
+		for (integer j = 1; j <= 3; j++) {
+			WM.PutRowIndex(iRow + j - 1, iMomIdx + j);
+			WM.PutColIndex(iRow + j - 1, iPosIdx + j);
 		}
 
-		const doublereal K_bek = KBek();
+		const Vec3& x = pNode->GetXCurr();
+		const Vec3& v = pNode->GetVCurr();
 
-		/* Update trial z_max (not committed — only updated at AfterConvergence) */
-		if (z > m_dZmax_trial) {
-			m_dZmax_trial = z;
+		doublereal d = (x - m_PlanePoint).Dot(m_Normal);
+		if (d >= 0.) {
+			iRow += 3;
+			continue;
 		}
 
-		doublereal F_el, dFdz;
+		doublereal VN    = -(v.Dot(m_Normal));
+		doublereal th    = std::tanh(VN / m_dVN0);
+		doublereal sech2 = 1.0 - th * th;
 
-		if (z >= m_dZmax) {
-			/* ===== Loading branch: virgin or deeper penetration ===== *
-			 * F = A * K_bek * z^n
-			 * dF/dz = A * K_bek * n * z^(n-1)                         */
-			doublereal z_safe = std::max(z, Z_FLOOR);
-			doublereal zn     = std::pow(z_safe, m_dN);
-			doublereal znm1   = std::pow(z_safe, m_dN - 1.0);
-			F_el  = m_dA * K_bek * zn;
-			dFdz  = m_dA * K_bek * m_dN * znm1;
+		/* dFNH/dVN: derivative of normal force magnitude w.r.t. approach velocity */
+		doublereal dFdVN = m_dACCA2 * m_dANOR
+			* VN * (2.0 * th + (VN / m_dVN0) * sech2);
+		if (dFdVN < 0.) dFdVN = 0.;
 
-		} else {
-			/* ===== Unloading/reloading branch ===== *
-			 * F = A * Ku * (z - z0)  [linear elastic from committed z_max] *
-			 * Ku and z0 are cached from the last committed z_max.           */
-			doublereal dz = z - m_dZ0;
-			if (dz < 0.) {
-				dz = 0.;   /* cannot pull soil upward (no adhesion) */
-			}
-			F_el  = m_dA * m_dKu * dz;
-			dFdz  = m_dA * m_dKu;
-		}
-
-		/* Viscous damping (stabilizes impact transient) */
-		doublereal F_damp = m_dCdamp * zp;
-
-		/* Total force and Jacobians.
+		/*
+		 * Velocity Jacobian (no dCoef factor):
+		 *   dF_normal_j / dv_k = -(dFNH/dVN) * n_j * n_k
 		 *
-		 * FDE (tangent stiffness dF/dEps):
-		 *   F = m_dSign * (F_el(z) + F_damp)  with  z = m_dSign * Eps
-		 *   dF/dEps = m_dSign * dFel/dz * dz/dEps = m_dSign * dFdz * m_dSign = dFdz
-		 * So FDE = dFdz regardless of sign, always >= 0. */
-		ConstitutiveLaw<doublereal, doublereal>::F        = m_dSign * (F_el + F_damp);
-		ConstitutiveLaw<doublereal, doublereal>::FDE      = dFdz;
-		ConstitutiveLaw<doublereal, doublereal>::FDEPrime = m_dSign * m_dCdamp;
-	};
+		 * Converted to position Jacobian via xp = (x - x_old)/dCoef:
+		 *   dF/dx_k = (dF/dv_k) / dCoef
+		 * In AssJac we add dCoef * dF/dx = dF/dv — so NO dCoef factor here.
+		 */
+		for (integer j = 1; j <= 3; j++) {
+			for (integer k = 1; k <= 3; k++) {
+				WM.IncCoef(iRow + j - 1, iRow + k - 1,
+					-dFdVN * m_Normal(j) * m_Normal(k));
+			}
+		}
 
-	virtual void AfterConvergence(const doublereal& Eps,
-		const doublereal& EpsPrime = 0.)
+		iRow += 3;
+	}
+
+	return WorkMat;
+}
+
+/* ========================================================================= */
+/* Output                                                                      */
+/* ========================================================================= */
+void SurfaceImpactElem::Output(OutputHandler& OH) const
+{
+	if (bToBeOutput() && OH.IsOpen(OutputHandler::LOADABLE)) {
+		std::ostream& out = OH.Loadable();
+		for (unsigned i = 0; i < m_nNodes; i++) {
+			out << GetLabel()
+				<< " " << m_Nodes[i]->GetLabel()
+				<< " " << m_Forces[i]
+				<< std::endl;
+		}
+	}
+}
+
+/* ========================================================================= */
+/* Restart                                                                     */
+/* ========================================================================= */
+std::ostream& SurfaceImpactElem::Restart(std::ostream& out) const
+{
+	out << "user defined: " << GetLabel() << ", surface impact"
+		<< ", plane normal, " << m_Normal
+		<< ", plane point, "  << m_PlanePoint
+		<< ", ACCA2, "  << m_dACCA2
+		<< ", area, "   << m_dANOR
+		<< ", VN0, "    << m_dVN0
+		<< ", friction, " << m_dMuS
+		<< ", nodes, " << m_nNodes;
+	for (unsigned i = 0; i < m_nNodes; i++) {
+		out << ", " << m_Nodes[i]->GetLabel();
+	}
+	out << ";" << std::endl;
+	return out;
+}
+
+/* ========================================================================= */
+/* Reader and registration                                                     */
+/* ========================================================================= */
+struct SurfaceImpactElemRead : public UserDefinedElemRead {
+	virtual UserDefinedElem *
+	Read(unsigned uLabel, const DofOwner *pDO,
+		DataManager *pDM, MBDynParser& HP) const
 	{
-		/* ---- Commit plastic state ---- *
-		 * If the trial z_max exceeds the committed value, the soil has
-		 * permanently deformed further. Update cached unloading parameters. */
-		if (m_dZmax_trial > m_dZmax) {
-			m_dZmax = m_dZmax_trial;
-			UpdateUnloadingCache(m_dZmax);
-		}
-		/* Reset trial accumulator for the next timestep */
-		m_dZmax_trial = m_dZmax;
-
-		/* ---- Commit contact state toggle ---- */
-		if (m_bToggling) {
-			if (m_bActive) {
-				m_bActive   = false;
-				/* Leg lifted off: keep m_dZmax (crater persists).
-				 * Reset trial to committed value so next contact
-				 * starts fresh from the existing crater. */
-				m_dZmax_trial = m_dZmax;
-			} else {
-				m_bActive = true;
-			}
-			m_bToggling = false;
-		}
-	};
+		return new SurfaceImpactElem(uLabel, pDO, pDM, HP);
+	}
 };
 
-/* ---- Reader ---- */
-struct BekkerSoilCLR : public ConstitutiveLawRead<doublereal, doublereal> {
-	virtual ConstitutiveLaw<doublereal, doublereal> *
-	Read(const DataManager* pDM, MBDynParser& HP, ConstLawType::Type& CLType) {
-		ConstitutiveLaw<doublereal, doublereal>* pCL = 0;
-
-		CLType = ConstLawType::VISCOELASTIC;
-
-		if (HP.IsKeyWord("help")) {
-			silent_cerr(
-				"BekkerSoilCL:\n"
-				"        bekker soil,\n"
-				"                [ , sign, { negative | positive | <sign> } , ]\n"
-				"                kc,         <kc>,       # cohesive modulus [N/m^(n+1)]\n"
-				"                kphi,       <kphi>,     # frictional modulus [N/m^(n+2)]\n"
-				"                n,          <n>,        # sinkage exponent [-], >= 0.5\n"
-				"                pad radius, <b>,        # effective contact radius [m]\n"
-				"                [ , pad area, <A>, ]    # override area (default: pi*b^2)\n"
-				"                damping,    <c_damp>,   # viscous damping [N*s/m], >= 0\n"
-				"                [ , initial zmax, <zmax0>, ]  # restore plastic state\n"
-				"                [ , prestrain, (DriveCaller)<prestrain> ]\n"
-				"\n"
-				"  Reference Bekker parameters (kc [N/m^(n+1)], kphi [N/m^(n+2)], n):\n"
-				"    Lunar regolith (loose): kc=1400,  kphi=820000,  n=1.0\n"
-				"    Lunar regolith (hard):  kc=5300,  kphi=1740000, n=1.0\n"
-				"    Mars regolith:          kc=800,   kphi=140000,  n=0.9\n"
-				"    Terrestrial dry sand:   kc=990,   kphi=1528000, n=1.1\n"
-				<< std::endl);
-
-			if (!HP.IsArg()) {
-				throw NoErr(MBDYN_EXCEPT_ARGS);
-			}
-		}
-
-		/* sign (default: negative — compression is negative Epsilon) */
-		doublereal dSign = -1.;
-		if (HP.IsKeyWord("sign")) {
-			if (HP.IsKeyWord("positive")) {
-				dSign = 1.;
-			} else if (HP.IsKeyWord("negative")) {
-				dSign = -1.;
-			} else {
-				doublereal d = HP.GetReal();
-				if (d == 0.) {
-					silent_cerr("BekkerSoilCLR: invalid sign " << d
-						<< " at line " << HP.GetLineData() << std::endl);
-					throw ErrGeneric(MBDYN_EXCEPT_ARGS);
-				}
-				dSign = copysign(1., d);
-			}
-		}
-
-		/* kc */
-		if (!HP.IsKeyWord("kc")) {
-			silent_cerr("BekkerSoilCLR: \"kc\" expected"
-				" at line " << HP.GetLineData() << std::endl);
-			throw ErrGeneric(MBDYN_EXCEPT_ARGS);
-		}
-		doublereal dKc = HP.GetReal();
-		if (dKc < 0.) {
-			silent_cerr("BekkerSoilCLR: invalid \"kc\" " << dKc
-				<< " at line " << HP.GetLineData() << std::endl);
-			throw ErrGeneric(MBDYN_EXCEPT_ARGS);
-		}
-
-		/* kphi */
-		if (!HP.IsKeyWord("kphi")) {
-			silent_cerr("BekkerSoilCLR: \"kphi\" expected"
-				" at line " << HP.GetLineData() << std::endl);
-			throw ErrGeneric(MBDYN_EXCEPT_ARGS);
-		}
-		doublereal dKphi = HP.GetReal();
-		if (dKphi <= 0.) {
-			silent_cerr("BekkerSoilCLR: invalid \"kphi\" " << dKphi
-				<< " at line " << HP.GetLineData() << std::endl);
-			throw ErrGeneric(MBDYN_EXCEPT_ARGS);
-		}
-
-		/* n */
-		if (!HP.IsKeyWord("n")) {
-			silent_cerr("BekkerSoilCLR: \"n\" expected"
-				" at line " << HP.GetLineData() << std::endl);
-			throw ErrGeneric(MBDYN_EXCEPT_ARGS);
-		}
-		doublereal dN = HP.GetReal();
-		if (dN < 0.5) {
-			silent_cerr("BekkerSoilCLR: invalid \"n\" " << dN
-				<< " (must be >= 0.5)"
-				" at line " << HP.GetLineData() << std::endl);
-			throw ErrGeneric(MBDYN_EXCEPT_ARGS);
-		}
-
-		/* pad radius */
-		if (!HP.IsKeyWord("pad" "radius")) {
-			silent_cerr("BekkerSoilCLR: \"pad radius\" expected"
-				" at line " << HP.GetLineData() << std::endl);
-			throw ErrGeneric(MBDYN_EXCEPT_ARGS);
-		}
-		doublereal dB = HP.GetReal();
-		if (dB <= 0.) {
-			silent_cerr("BekkerSoilCLR: invalid \"pad radius\" " << dB
-				<< " at line " << HP.GetLineData() << std::endl);
-			throw ErrGeneric(MBDYN_EXCEPT_ARGS);
-		}
-
-		/* pad area (optional — defaults to pi*b^2) */
-		doublereal dA = M_PI_LOCAL * dB * dB;
-		if (HP.IsKeyWord("pad" "area")) {
-			dA = HP.GetReal();
-			if (dA <= 0.) {
-				silent_cerr("BekkerSoilCLR: invalid \"pad area\" " << dA
-					<< " at line " << HP.GetLineData() << std::endl);
-				throw ErrGeneric(MBDYN_EXCEPT_ARGS);
-			}
-		}
-
-		/* damping */
-		if (!HP.IsKeyWord("damping")) {
-			silent_cerr("BekkerSoilCLR: \"damping\" expected"
-				" at line " << HP.GetLineData() << std::endl);
-			throw ErrGeneric(MBDYN_EXCEPT_ARGS);
-		}
-		doublereal dCdamp = HP.GetReal();
-		if (dCdamp < 0.) {
-			silent_cerr("BekkerSoilCLR: invalid \"damping\" " << dCdamp
-				<< " at line " << HP.GetLineData() << std::endl);
-			throw ErrGeneric(MBDYN_EXCEPT_ARGS);
-		}
-
-		/* initial zmax (optional — for restarting with existing plastic state) */
-		doublereal dZmax0 = 0.;
-		if (HP.IsKeyWord("initial" "zmax")) {
-			dZmax0 = HP.GetReal();
-			if (dZmax0 < 0.) {
-				silent_cerr("BekkerSoilCLR: invalid \"initial zmax\" " << dZmax0
-					<< " at line " << HP.GetLineData() << std::endl);
-				throw ErrGeneric(MBDYN_EXCEPT_ARGS);
-			}
-		}
-
-		/* Prestrain drive (optional) */
-		TplDriveCaller<doublereal> *pTplDC = GetPreStrain<doublereal>(pDM, HP);
-
-		SAFENEWWITHCONSTRUCTOR(pCL, BekkerSoilCL,
-			BekkerSoilCL(pTplDC, dSign,
-				dKc, dKphi, dN,
-				dB, dA,
-				dCdamp,
-				dZmax0));
-
-		return pCL;
-	};
-};
-
-/* ---- Module registration ---- */
 extern "C" int
 module_init(const char *module_name, void *pdm, void *php)
 {
-	ConstitutiveLawRead<doublereal, doublereal> *rf1D = new BekkerSoilCLR;
-	if (!SetCL1D("bekker" "soil", rf1D)) {
-		delete rf1D;
-		silent_cerr("BekkerSoilCL: "
+	UserDefinedElemRead *rf = new SurfaceImpactElemRead;
+	if (!SetUDE("surface" "impact", rf)) {
+		delete rf;
+		silent_cerr("SurfaceImpactElem: "
 			"module_init(" << module_name << ") "
 			"failed" << std::endl);
 		return -1;

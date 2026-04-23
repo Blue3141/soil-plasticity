@@ -1,20 +1,16 @@
 /*
- * Test: capsule landing on lunar regolith (loose) — 4-leg configuration
+ * Test: capsula che cade su piano lunare — nodo singolo
  *
- * A 500 kg capsule descends at 3 m/s and lands on 4 legs.
- * Legs touch down simultaneously (symmetric case).
- * Each leg has its own BekkerSoilCL instance with independent m_dZmax.
+ * Una massa di 500 kg scende a 3 m/s. Il piano è z=0, normale (0,0,1).
+ * Il nodo parte da z=0.5 m, quindi entra in contatto dopo ~0.17 s.
  *
- * Lunar gravity: 1.62 m/s^2
- * Lunar regolith (loose): kc=1400, kphi=820000, n=1.0, pad_radius=0.20 m
- *
- * The test verifies:
- *   1. Landing deceleration profile
- *   2. Final sinkage per leg (static equilibrium)
- *   3. Permanent sinkage retained after any bounce
+ * FNH = ACCA2 * ANOR * VN^2 * tanh(VN/VN0)
+ *   ACCA2 = 0.5 * 1700 * 1.2 = 1020 kg/m^3
+ *   ANOR  = pi * 0.1^2 = 0.0314 m^2  (pad circolare r=0.1 m)
+ *   VN0   = 0.3 m/s
  *
  * Usage:
- *   mbdyn -f lunar_landing.mbd -o lunar_landing
+ *   mbdyn -f lunar_landing.mbd -o out/lunar_landing
  */
 
 begin: data;
@@ -24,95 +20,50 @@ end: data;
 begin: initial value;
     initial time: 0.;
     final time: 5.;
-    time step: 5.e-4;
+    time step: 1.e-3;
     max iterations: 30;
     tolerance: 1.e-6;
     method: ms, 0.6;
 end: initial value;
 
 begin: control data;
-    structural nodes: 5;     # 1 capsule body node + 4 ground nodes
+    structural nodes: 1;
     rigid bodies: 1;
-    joints: 8;               # 4 ground clamps + 4 soil rod contacts
+    loadable elements: 1;
     gravity;
-    use: loadable elements, in assembly;
 end: control data;
 
 module load: "libmodule-soil-plasticity";
 
 begin: nodes;
-    # Ground nodes below each leg (fixed via clamp joint)
-    structural node: 1, dynamic, -1., -1., 0., eye, null, null;  # leg 1
-    structural node: 2, dynamic,  1., -1., 0., eye, null, null;  # leg 2
-    structural node: 3, dynamic,  1.,  1., 0., eye, null, null;  # leg 3
-    structural node: 4, dynamic, -1.,  1., 0., eye, null, null;  # leg 4
-
-    # Capsule center-of-mass node
-    # Initial position: 1.5 m above ground (legs extend 1.5 m below CoM)
-    # Initial velocity: 3 m/s downward
-    structural node: 5,
+    structural: 1,
         dynamic,
-        0., 0., 1.5,        # position [m]
+        0., 0., 0.5,
         eye,
-        0., 0., -3.,        # velocity [m/s] — descending
+        0., 0., -3.,
         null;
 end: nodes;
 
 begin: elements;
-    gravity: 0., 0., -1., const, 1.62;  # lunar gravity
+    gravity: uniform, 0., 0., -1., 1.62;
 
-    # Capsule: 500 kg, approximate inertia for 2 m diameter sphere
     body: 1,
-        5,
+        1,
         500.,
         null,
-        diag, 200., 200., 200.;
+        eye;
 
-    # Ground clamps
-    joint: 1, clamp, 1, node, node;
-    joint: 2, clamp, 2, node, node;
-    joint: 3, clamp, 3, node, node;
-    joint: 4, clamp, 4, node, node;
-
-    # Soil contacts — one per leg
-    # Natural length = distance from ground node to capsule node at t=0
-    # = sqrt((1^2 + 1^2 + 1.5^2)) = sqrt(1+1+2.25) = sqrt(4.25) ≈ 2.0616 m
-    # Each rod: capsule node (5) <-> respective ground node (1..4)
-
-    joint: 5, rod,
-        5, 1, from nodes,
-        bekker soil,
-            sign, negative,
-            kc, 1400., kphi, 820000., n, 1.0,
-            pad radius, 0.20,
-            damping, 2000.;
-
-    joint: 6, rod,
-        5, 2, from nodes,
-        bekker soil,
-            sign, negative,
-            kc, 1400., kphi, 820000., n, 1.0,
-            pad radius, 0.20,
-            damping, 2000.;
-
-    joint: 7, rod,
-        5, 3, from nodes,
-        bekker soil,
-            sign, negative,
-            kc, 1400., kphi, 820000., n, 1.0,
-            pad radius, 0.20,
-            damping, 2000.;
-
-    joint: 8, rod,
-        5, 4, from nodes,
-        bekker soil,
-            sign, negative,
-            kc, 1400., kphi, 820000., n, 1.0,
-            pad radius, 0.20,
-            damping, 2000.;
-
-    output: joint, 5;
-    output: joint, 6;
-    output: joint, 7;
-    output: joint, 8;
+    /* ACCA2 = 0.5 * rho * Cd: scelto in modo che FNH = weight a VN = 3 m/s
+     *   FNH = ACCA2 * ANOR * VN^2 = weight = 500 * 1.62 = 810 N
+     *   ACCA2 = 810 / (ANOR * VN^2) = 810 / (0.0314 * 9) = 2866 kg/m^3
+     * VN0 = 10% di VN_max = 0.3 m/s */
+    user defined: 1, surface impact,
+        plane normal, 0., 0., 1.,
+        plane point,  0., 0., 0.,
+        ACCA2,   2866.,
+        area,    0.0314,
+        VN0,     0.3,
+        friction, 0.4,
+        nodes, 1,
+            1;
 end: elements;
