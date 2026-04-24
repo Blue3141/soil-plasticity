@@ -67,6 +67,7 @@ begin: elements;
         hydrodynamic,
             h,    1020.,
             VN0,  0.3,
+            ZN0,  0.02,
         friction, 0.4,
         nodes, 1,
             1;

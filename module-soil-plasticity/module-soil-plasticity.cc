@@ -47,10 +47,13 @@
  *    converged timestep via AfterConvergence().
  *
  * 2) Hydrodynamic (OPTIONAL, keyword "hydrodynamic"):
- *      FNH = h * ANOR * VN^2 * tanh(VN / VN0)
+ *      FNH = h * ANOR * VN^2 * tanh(VN/VN0) * tanh((z-z0)/ZN0)
  *    h   = 0.5 * rho * Cd  (flat plate Cd=1.2 → h = 0.5*rho*1.2)
- *    VN  = approach velocity normal to plane (positive = into surface)
- *    VN0 = reference velocity (~10% of max expected VN) for tanh stabilisation
+ *    VN  = approach velocity (positive = into surface); zero for separation
+ *    VN0 = velocity scale for tanh (~10% of max expected VN)
+ *    z0  = permanent sinkage from Bekker plasticity (per-node, updated each step)
+ *    ZN0 = depth ramp scale from z0; tanh((z-z0)/ZN0) provides both the
+ *          activation threshold (zero at z=z0) and a smooth ramp-up
  *
  * ---- Total normal force ----
  *    FN = F_BEK + FNH   (clamped >= 0, no adhesion)
@@ -77,7 +80,9 @@
  *       [ , area, <anor>, ]               # contact area [m^2] (default: pi*b^2)
  *       [ , hydrodynamic,               # optional hydrodynamic term
  *             h,    <h>,                #   h = 0.5*rho*Cd  [kg/m^3]
- *             VN0,  <vn0>, ]            #   reference velocity [m/s]
+ *             VN0,  <vn0>,              #   velocity scale for tanh(VN/VN0) [m/s]
+ *             ZN0,  <zn0>, ]            #   depth ramp scale from z0 [m]
+ *                                       #   FNH=h*A*VN^2*tanh(VN/VN0)*tanh((z-z0)/ZN0)
  *       [ , friction, <mu_s>, ]           # Coulomb coefficient [-]
  *       nodes, <N>,                       # number of nodes
  *           <label_1>, ..., <label_N>     # structural node labels
@@ -130,7 +135,8 @@ private:
 	/* ---- hydrodynamic (optional) ---- */
 	bool       m_bHydro;  /* enabled */
 	doublereal m_dH;      /* h = 0.5*rho*Cd  [kg/m^3] */
-	doublereal m_dVN0;    /* reference velocity for tanh [m/s] */
+	doublereal m_dVN0;    /* velocity scale for tanh(VN/VN0) [m/s] */
+	doublereal m_dZN0;    /* depth scale for spatial ramp tanh((z-z0)/ZN0) [m] */
 
 	/* ---- friction ---- */
 	doublereal m_dMuS;
@@ -235,7 +241,7 @@ SurfaceImpactElem::SurfaceImpactElem(unsigned uLabel, const DofOwner *pDO,
 m_Normal(Zero3), m_PlanePoint(Zero3),
 m_dKc(0.), m_dKphi(0.), m_dNbek(1.), m_dB(1.), m_dANOR(0.),
 m_dKplastic(0.5),
-m_bHydro(false), m_dH(0.), m_dVN0(1.),
+m_bHydro(false), m_dH(0.), m_dVN0(1.), m_dZN0(0.01),
 m_dMuS(0.), m_nNodes(0)
 {
 	if (HP.IsKeyWord("help")) {
@@ -250,7 +256,7 @@ m_dMuS(0.), m_nNodes(0)
 			"      pad radius, <b>,\n"
 			"      [ , area, <anor>, ]\n"
 			"      [ , plastic ratio, <k_p>, ]\n"
-			"      [ , hydrodynamic, h, <h>, VN0, <vn0>, ]\n"
+			"      [ , hydrodynamic, h, <h>, VN0, <vn0>, ZN0, <zn0>, ]\n"
 			"      [ , friction, <mu_s>, ]\n"
 			"      nodes, <N>, <label_1>, ..., <label_N>;\n"
 			<< std::endl);
@@ -398,6 +404,19 @@ m_dMuS(0.), m_nNodes(0)
 				<< HP.GetLineData() << std::endl);
 			throw ErrGeneric(MBDYN_EXCEPT_ARGS);
 		}
+		if (!HP.IsKeyWord("ZN0")) {
+			silent_cerr("SurfaceImpactElem(" << uLabel
+				<< "): \"ZN0\" expected after VN0 at line "
+				<< HP.GetLineData() << std::endl);
+			throw ErrGeneric(MBDYN_EXCEPT_ARGS);
+		}
+		m_dZN0 = HP.GetReal();
+		if (m_dZN0 <= 0.) {
+			silent_cerr("SurfaceImpactElem(" << uLabel
+				<< "): ZN0 must be > 0 at line "
+				<< HP.GetLineData() << std::endl);
+			throw ErrGeneric(MBDYN_EXCEPT_ARGS);
+		}
 	}
 
 	/* friction (optional) */
@@ -517,13 +536,20 @@ SubVectorHandler& SurfaceImpactElem::AssRes(
 			}
 		}
 
-		/* ---- Hydrodynamic (optional): FNH = h*ANOR*VN^2*tanh(VN/VN0) ---- */
+		/* ---- Hydrodynamic (optional) ----
+		 * FNH = h*ANOR*VN^2*tanh(VN/VN0)*tanh((z-z0)/ZN0)
+		 * Active only for VN>0 and z>z0 (soil compressing above permanent sinkage).
+		 * The spatial tanh provides both the threshold and a smooth ramp-up. */
 		doublereal FNH = 0.;
 		if (m_bHydro) {
-			doublereal VN = -(v.Dot(m_Normal));   /* positive = approaching */
+			doublereal VN = -(v.Dot(m_Normal));
 			if (VN > 0.) {
-				doublereal th = std::tanh(VN / m_dVN0);
-				FNH = m_dH * m_dANOR * VN * VN * th;
+				doublereal dz_eff = z - m_dZ0[i];
+				doublereal ramp = std::tanh(dz_eff / m_dZN0);
+				if (ramp > 0.) {
+					doublereal th = std::tanh(VN / m_dVN0);
+					FNH = m_dH * m_dANOR * VN * VN * th * ramp;
+				}
 			}
 		}
 
@@ -610,24 +636,37 @@ VariableSubMatrixHandler& SurfaceImpactElem::AssJac(
 			dFBEK_dz = 0.;   /* free zone: no force gradient */
 		}
 
-		/* Hydrodynamic velocity term (no dCoef factor):
-		 * FNH = h*ANOR*VN^2*tanh(VN/VN0), VN = -(v·n)
-		 * dFNH/dVN = h*ANOR*VN*(2*tanh + VN/VN0*sech^2)
-		 * dFNH/dv_k = dFNH/dVN * (-n_k)  →  J_jk += -dFNH_dVN * n_j * n_k */
-		doublereal dFNH_dVN = 0.;
+		/* Hydrodynamic Jacobian contributions.
+		 * FNH = h*ANOR*VN^2*tanh(VN/VN0)*ramp,  ramp = tanh((z-z0)/ZN0)
+		 *
+		 * Velocity term (no dCoef):
+		 *   dFNH/dVN = h*ANOR*VN*(2*tanh_v + VN/VN0*sech2_v)*ramp
+		 *   dFNH/dv_k = dFNH/dVN * (-n_k)
+		 *
+		 * Position term (with dCoef):
+		 *   dFNH/dz = h*ANOR*VN^2*tanh_v * (1/ZN0)*sech2_z
+		 *   dFNH/dx_k = dFNH/dz * (-n_k) */
+		doublereal dFNH_dVN = 0., dFNH_dz = 0.;
 		if (m_bHydro) {
 			doublereal VN = -(v.Dot(m_Normal));
 			if (VN > 0.) {
-				doublereal th    = std::tanh(VN / m_dVN0);
-				doublereal sech2 = 1.0 - th * th;
-				dFNH_dVN = m_dH * m_dANOR
-				         * VN * (2.0 * th + (VN / m_dVN0) * sech2);
+				doublereal dz_eff = z - m_dZ0[i];
+				doublereal ramp   = std::tanh(dz_eff / m_dZN0);
+				if (ramp > 0.) {
+					doublereal sech2_z = 1.0 - ramp * ramp;
+					doublereal th_v    = std::tanh(VN / m_dVN0);
+					doublereal sech2_v = 1.0 - th_v * th_v;
+					doublereal base    = m_dH * m_dANOR * VN;
+					dFNH_dVN = base * (2.0 * th_v + (VN / m_dVN0) * sech2_v) * ramp;
+					dFNH_dz  = base * VN * th_v * sech2_z / m_dZN0;
+				}
 			}
 		}
 
-		/* Combined: Jnn = -(dCoef*dFBEK_dz + dFNH_dVN)
-		 * (velocity contribution has no dCoef because it acts on XPrimeCurr) */
-		doublereal Jnn = -(dCoef * dFBEK_dz + dFNH_dVN);
+		/* Combined Jnn:
+		 *   position terms (×dCoef): Bekker stiffness + hydrodynamic spatial ramp
+		 *   velocity term  (no dCoef): hydrodynamic VN derivative */
+		doublereal Jnn = -(dCoef * (dFBEK_dz + dFNH_dz) + dFNH_dVN);
 
 		for (integer j = 1; j <= 3; j++) {
 			for (integer k = 1; k <= 3; k++) {
@@ -691,7 +730,8 @@ std::ostream& SurfaceImpactElem::Restart(std::ostream& out) const
 		<< ", plastic ratio, "<< m_dKplastic;
 	if (m_bHydro) {
 		out << ", hydrodynamic, h, " << m_dH
-		    << ", VN0, "              << m_dVN0;
+		    << ", VN0, "              << m_dVN0
+		    << ", ZN0, "              << m_dZN0;
 	}
 	out << ", friction, " << m_dMuS
 		<< ", nodes, " << m_nNodes;
