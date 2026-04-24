@@ -46,14 +46,14 @@
  *    z_max is the maximum historical penetration, committed per node at each
  *    converged timestep via AfterConvergence().
  *
- * 2) Hydrodynamic (OPTIONAL, keyword "hydrodynamic"):
- *      FNH = ACCA2 * ANOR * VN^2 * tanh(VN / VN0)
- *    ACCA2 = 0.5 * rho * Cd  (flat plate: Cd = 1.2)
+ * 2) Hunt-Crossley damping (OPTIONAL, keyword "damping ratio"):
+ *      F_damp = alpha * F_BEK * max(VN, 0)
+ *    alpha = damping ratio [s/m], physically ≈ 3*(1-e^2)/(2*e*VN_impact)
  *    VN    = approach velocity normal to plane (positive = into surface)
- *    VN0   = reference velocity (~10% of max expected VN) for tanh stabilisation
+ *    Naturally zero at first contact (F_BEK=0) and on separation (VN<=0).
  *
  * ---- Total normal force ----
- *    FN = F_BEK + FNH   (clamped >= 0, no adhesion)
+ *    FN = F_BEK + F_damp   (clamped >= 0, no adhesion)
  *
  * ---- Coulomb friction (OPTIONAL, keyword "friction") ----
  *    F_fric = -mu_s * FN * (VT / |VT|)
@@ -75,9 +75,9 @@
  *       n,          <n>,                  # sinkage exponent [-], >= 0.5
  *       pad radius, <b>,                  # smaller sinkage dimension [m]
  *       [ , area, <anor>, ]               # contact area [m^2] (default: pi*b^2)
- *       [ , hydrodynamic,                 # optional block
- *             ACCA2, <acca2>,             #   0.5*rho*Cd [kg/m^3]
- *             VN0,   <vn0>,    ]          #   reference velocity [m/s]
+ *       [ , damping ratio, <alpha>, ]      # Hunt-Crossley coeff [s/m]
+ *                                         # F_damp = alpha * F_BEK * VN
+ *                                         # (attivo solo per VN > 0, parte da z0)
  *       [ , friction, <mu_s>, ]           # Coulomb coefficient [-]
  *       nodes, <N>,                       # number of nodes
  *           <label_1>, ..., <label_N>     # structural node labels
@@ -116,16 +116,22 @@ private:
 	Vec3 m_PlanePoint;
 
 	/* ---- Bekker-Wong (mandatory) ---- */
-	doublereal m_dKc;     /* cohesive modulus [N/m^(n+1)] */
-	doublereal m_dKphi;   /* frictional modulus [N/m^(n+2)] */
-	doublereal m_dNbek;   /* sinkage exponent [-] */
-	doublereal m_dB;      /* pad radius / smaller dimension [m] */
-	doublereal m_dANOR;   /* contact area [m^2] */
+	doublereal m_dKc;        /* cohesive modulus [N/m^(n+1)] */
+	doublereal m_dKphi;      /* frictional modulus [N/m^(n+2)] */
+	doublereal m_dNbek;      /* sinkage exponent [-] */
+	doublereal m_dB;         /* pad radius / smaller dimension [m] */
+	doublereal m_dANOR;      /* contact area [m^2] */
+	doublereal m_dKplastic;  /* plastic ratio: z0 = k_p * z_max, 0 < k_p < 1
+	                          * fraction of z_max that remains as permanent sinkage.
+	                          * k_p=0 → elastic (no dissipation); k_p→1 → all plastic.
+	                          * Dissipation requires k_p > 1 - 2/(n+1), e.g. for n=1
+	                          * any k_p > 0 gives dissipation. Default: 0.5 */
 
-	/* ---- hydrodynamic (optional) ---- */
-	bool       m_bHydro;
-	doublereal m_dACCA2;  /* 0.5*rho*Cd [kg/m^3] */
-	doublereal m_dVN0;    /* reference velocity for tanh [m/s] */
+	/* ---- Hunt-Crossley damping (optional) ---- */
+	doublereal m_dAlpha;  /* damping ratio [s/m]; 0 = no damping
+	                       * F_damp = alpha * F_BEK * max(VN,0)
+	                       * Physically: alpha ≈ 3*(1-e^2)/(2*e*VN_impact)
+	                       * where e = coeff of restitution */
 
 	/* ---- friction ---- */
 	doublereal m_dMuS;
@@ -146,15 +152,22 @@ private:
 	/* Bekker bearing coefficient */
 	doublereal KBek(void) const { return m_dKc / m_dB + m_dKphi; }
 
-	/* Recompute unloading parameters from a given z_max */
+	/* Recompute unloading parameters from a given z_max.
+	 *
+	 * Permanent sinkage:  z0 = k_plastic * z_max
+	 * Unloading stiffness (ensures force continuity at z_max):
+	 *   Ku = F_BEK(z_max) / (z_max - z0)
+	 *      = A*KBek*z_max^n / (z_max*(1 - k_p))
+	 *      = A*KBek*z_max^(n-1) / (1 - k_p)
+	 *
+	 * Energy dissipated per cycle (positive for k_p > 1 - 2/(n+1)):
+	 *   E = A*KBek*z_max^(n+1) * [1/(n+1) - (1-k_p)/2]
+	 */
 	void UpdateUnloading(unsigned i, doublereal z_max) {
-		if (z_max > Z_FLOOR) {
-			m_dKu[i] = m_dNbek * KBek() * std::pow(z_max, m_dNbek - 1.0);
-			m_dZ0[i] = z_max * (1.0 - 1.0 / m_dNbek);
-		} else {
-			m_dKu[i] = m_dNbek * KBek() * std::pow(Z_FLOOR, m_dNbek - 1.0);
-			m_dZ0[i] = 0.;
-		}
+		doublereal z_ref = std::max(z_max, Z_FLOOR);
+		m_dKu[i] = KBek() * std::pow(z_ref, m_dNbek - 1.0)
+		         / (1.0 - m_dKplastic);
+		m_dZ0[i] = m_dKplastic * z_max;
 	}
 
 public:
@@ -222,7 +235,8 @@ SurfaceImpactElem::SurfaceImpactElem(unsigned uLabel, const DofOwner *pDO,
 : UserDefinedElem(uLabel, pDO),
 m_Normal(Zero3), m_PlanePoint(Zero3),
 m_dKc(0.), m_dKphi(0.), m_dNbek(1.), m_dB(1.), m_dANOR(0.),
-m_bHydro(false), m_dACCA2(0.), m_dVN0(1.),
+m_dKplastic(0.5),
+m_dAlpha(0.),
 m_dMuS(0.), m_nNodes(0)
 {
 	if (HP.IsKeyWord("help")) {
@@ -236,9 +250,8 @@ m_dMuS(0.), m_nNodes(0)
 			"      n,          <n>,\n"
 			"      pad radius, <b>,\n"
 			"      [ , area, <anor>, ]\n"
-			"      [ , hydrodynamic,\n"
-			"            ACCA2, <acca2>,\n"
-			"            VN0,   <vn0>, ]\n"
+			"      [ , plastic ratio, <k_p>, ]\n"
+			"      [ , damping ratio, <alpha>, ]\n"
 			"      [ , friction, <mu_s>, ]\n"
 			"      nodes, <N>, <label_1>, ..., <label_N>;\n"
 			<< std::endl);
@@ -343,34 +356,29 @@ m_dMuS(0.), m_nNodes(0)
 		}
 	}
 
-	/* hydrodynamic block (optional) */
-	if (HP.IsKeyWord("hydrodynamic")) {
-		m_bHydro = true;
+	/* plastic ratio k_p (optional, default 0.5)
+	 * z0 = k_p * z_max  — fraction of max sinkage that remains permanently.
+	 * Must satisfy k_p > 1 - 2/(n+1) for energy dissipation.
+	 * For n=1: any k_p > 0 dissipates energy. */
+	if (HP.IsKeyWord("plastic" "ratio")) {
+		m_dKplastic = HP.GetReal();
+		if (m_dKplastic <= 0. || m_dKplastic >= 1.) {
+			silent_cerr("SurfaceImpactElem(" << uLabel
+				<< "): plastic ratio must be in (0, 1) at line "
+				<< HP.GetLineData() << std::endl);
+			throw ErrGeneric(MBDYN_EXCEPT_ARGS);
+		}
+	}
 
-		if (!HP.IsKeyWord("ACCA2")) {
+	/* Hunt-Crossley damping ratio alpha (optional, default 0)
+	 * F_damp = alpha * F_BEK * max(VN, 0)
+	 * Physical estimate: alpha ≈ 3*(1-e^2)/(2*e*VN_impact)
+	 * e.g. e=0.5, VN_impact=3 m/s -> alpha ≈ 0.75 s/m */
+	if (HP.IsKeyWord("damping" "ratio")) {
+		m_dAlpha = HP.GetReal();
+		if (m_dAlpha < 0.) {
 			silent_cerr("SurfaceImpactElem(" << uLabel
-				<< "): \"ACCA2\" expected in hydrodynamic block at line "
-				<< HP.GetLineData() << std::endl);
-			throw ErrGeneric(MBDYN_EXCEPT_ARGS);
-		}
-		m_dACCA2 = HP.GetReal();
-		if (m_dACCA2 <= 0.) {
-			silent_cerr("SurfaceImpactElem(" << uLabel
-				<< "): ACCA2 must be > 0 at line "
-				<< HP.GetLineData() << std::endl);
-			throw ErrGeneric(MBDYN_EXCEPT_ARGS);
-		}
-
-		if (!HP.IsKeyWord("VN0")) {
-			silent_cerr("SurfaceImpactElem(" << uLabel
-				<< "): \"VN0\" expected in hydrodynamic block at line "
-				<< HP.GetLineData() << std::endl);
-			throw ErrGeneric(MBDYN_EXCEPT_ARGS);
-		}
-		m_dVN0 = HP.GetReal();
-		if (m_dVN0 <= 0.) {
-			silent_cerr("SurfaceImpactElem(" << uLabel
-				<< "): VN0 must be > 0 at line "
+				<< "): damping ratio must be >= 0 at line "
 				<< HP.GetLineData() << std::endl);
 			throw ErrGeneric(MBDYN_EXCEPT_ARGS);
 		}
@@ -488,27 +496,23 @@ SubVectorHandler& SurfaceImpactElem::AssRes(
 			dFBEK_dz = m_dANOR * m_dKu[i];
 		}
 
-		/* ---- Hydrodynamic (optional) ---- */
-		doublereal FNH    = 0.;
-		doublereal dFNH_dVN = 0.;
-
-		if (m_bHydro) {
-			doublereal VN  = -(v.Dot(m_Normal));
-			doublereal th  = std::tanh(VN / m_dVN0);
-			doublereal sech2 = 1.0 - th * th;
-			FNH     = m_dACCA2 * m_dANOR * VN * VN * th;
-			if (FNH < 0.) FNH = 0.;
-			dFNH_dVN = m_dACCA2 * m_dANOR
-			         * VN * (2.0 * th + (VN / m_dVN0) * sech2);
-			if (dFNH_dVN < 0.) dFNH_dVN = 0.;
+		/* ---- Hunt-Crossley damping (optional) ---- *
+		 * F_damp = alpha * F_BEK * max(VN, 0)
+		 * Naturally zero at contact onset (F_BEK=0 there), grows with
+		 * both penetration depth and approach speed. */
+		doublereal F_damp = 0.;
+		if (m_dAlpha > 0.) {
+			doublereal VN = -(v.Dot(m_Normal));
+			if (VN > 0.) {
+				F_damp = m_dAlpha * F_BEK * VN;
+			}
 		}
 
 		/* ---- Total normal force ---- */
-		doublereal FN = F_BEK + FNH;
+		doublereal FN = F_BEK + F_damp;
 		if (FN < 0.) FN = 0.;
 
-		/* Store dFBEK_dz and dFNH_dVN for AssJac — recomputed there */
-		(void)dFBEK_dz; (void)dFNH_dVN;   /* computed fresh in AssJac */
+		(void)dFBEK_dz;   /* computed fresh in AssJac */
 
 		Vec3 F_total = m_Normal * FN;
 
@@ -595,25 +599,26 @@ VariableSubMatrixHandler& SurfaceImpactElem::AssJac(
 			dFBEK_dz = m_dANOR * m_dKu[i];
 		}
 
-		/* Hydrodynamic damping (velocity-dependent, no dCoef) */
-		doublereal dFNH_dVN = 0.;
-		if (m_bHydro) {
-			doublereal VN    = -(v.Dot(m_Normal));
-			doublereal th    = std::tanh(VN / m_dVN0);
-			doublereal sech2 = 1.0 - th * th;
-			dFNH_dVN = m_dACCA2 * m_dANOR
-				* VN * (2.0 * th + (VN / m_dVN0) * sech2);
-			if (dFNH_dVN < 0.) dFNH_dVN = 0.;
+		/* Hunt-Crossley Jacobian contribution.
+		 * F_damp = alpha * F_BEK * VN_pos
+		 * dF_damp_j/dx_k = -dCoef * alpha * dFBEK_dz * VN_pos * n_j * n_k
+		 * dF_damp_j/dv_k =         -alpha * F_BEK             * n_j * n_k  (no dCoef)
+		 * Combined Jnn = -(dCoef * dFBEK_dz * (1 + alpha*VN_pos) + alpha*F_BEK_cur) */
+		doublereal F_BEK_cur = 0., VN_pos = 0.;
+		if (m_dAlpha > 0.) {
+			doublereal VN = -(v.Dot(m_Normal));
+			VN_pos = std::max(VN, 0.);
+			if (z >= m_dZmax[i]) {
+				doublereal z_safe = std::max(z, Z_FLOOR);
+				F_BEK_cur = m_dANOR * KBek() * std::pow(z_safe, m_dNbek);
+			} else {
+				doublereal dz = z - m_dZ0[i];
+				if (dz < 0.) dz = 0.;
+				F_BEK_cur = m_dANOR * m_dKu[i] * dz;
+			}
 		}
-
-		/*
-		 * z = -d = -(x-P0)·n  →  dz/dx_k = -n_k
-		 * dF_BEK_j/dx_k = dF_BEK/dz * dz/dx_k * n_j = -dFBEK_dz * n_k * n_j
-		 * VN = -(v·n)        →  dVN/dv_k = -n_k
-		 * dFNH_j/dv_k       = dFNH/dVN * dVN/dv_k * n_j = -dFNH_dVN * n_k * n_j
-		 * Combined Jnn (negative): -(dCoef*dFBEK_dz + dFNH_dVN)
-		 */
-		doublereal Jnn = -(dCoef * dFBEK_dz + dFNH_dVN);
+		doublereal Jnn = -(dCoef * dFBEK_dz * (1.0 + m_dAlpha * VN_pos)
+		                   + m_dAlpha * F_BEK_cur);
 
 		for (integer j = 1; j <= 3; j++) {
 			for (integer k = 1; k <= 3; k++) {
@@ -669,15 +674,14 @@ std::ostream& SurfaceImpactElem::Restart(std::ostream& out) const
 	out << "user defined: " << GetLabel() << ", surface impact"
 		<< ", plane normal, " << m_Normal
 		<< ", plane point, "  << m_PlanePoint
-		<< ", kc, "         << m_dKc
-		<< ", kphi, "       << m_dKphi
-		<< ", n, "          << m_dNbek
-		<< ", pad radius, " << m_dB
-		<< ", area, "       << m_dANOR;
-	if (m_bHydro) {
-		out << ", hydrodynamic"
-			<< ", ACCA2, " << m_dACCA2
-			<< ", VN0, "   << m_dVN0;
+		<< ", kc, "           << m_dKc
+		<< ", kphi, "         << m_dKphi
+		<< ", n, "            << m_dNbek
+		<< ", pad radius, "   << m_dB
+		<< ", area, "         << m_dANOR
+		<< ", plastic ratio, "<< m_dKplastic;
+	if (m_dAlpha > 0.) {
+		out << ", damping ratio, " << m_dAlpha;
 	}
 	out << ", friction, " << m_dMuS
 		<< ", nodes, " << m_nNodes;
