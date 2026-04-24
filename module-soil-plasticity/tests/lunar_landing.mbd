@@ -32,7 +32,7 @@ begin: control data;
     rigid bodies: 1;
     loadable elements: 1;
     gravity;
-    default output: structural, accelerations;
+    default output: structural, accelerations, loadable;
 end: control data;
 
 module load: "libmodule-soil-plasticity";
