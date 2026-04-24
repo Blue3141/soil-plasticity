@@ -744,7 +744,11 @@ void SurfaceImpactElem::Output(OutputHandler& OH) const
 		for (unsigned i = 0; i < m_nNodes; i++) {
 			out << GetLabel()
 				<< " " << m_Nodes[i]->GetLabel()
-				<< " " << m_Forces[i]
+				<< " " << m_Forces[i]      /* Fx Fy Fz  (total) */
+				<< " " << m_dFBEK[i]       /* Bekker normal force */
+				<< " " << m_dFNH[i]        /* hydrodynamic normal force */
+				<< " " << m_dFN[i]         /* total normal force */
+				<< " " << m_dZ0[i]         /* permanent sinkage */
 				<< std::endl;
 		}
 	}
