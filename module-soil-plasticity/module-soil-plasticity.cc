@@ -46,8 +46,14 @@
  *    z_max is the maximum historical penetration, committed per node at each
  *    converged timestep via AfterConvergence().
  *
+ * 2) Hydrodynamic (OPTIONAL, keyword "hydrodynamic"):
+ *      FNH = h * ANOR * VN^2 * tanh(VN / VN0)
+ *    h   = 0.5 * rho * Cd  (flat plate Cd=1.2 → h = 0.5*rho*1.2)
+ *    VN  = approach velocity normal to plane (positive = into surface)
+ *    VN0 = reference velocity (~10% of max expected VN) for tanh stabilisation
+ *
  * ---- Total normal force ----
- *    FN = F_BEK   (clamped >= 0, no adhesion)
+ *    FN = F_BEK + FNH   (clamped >= 0, no adhesion)
  *
  * ---- Coulomb friction (OPTIONAL, keyword "friction") ----
  *    F_fric = -mu_s * FN * (VT / |VT|)
@@ -69,6 +75,9 @@
  *       n,          <n>,                  # sinkage exponent [-], >= 0.5
  *       pad radius, <b>,                  # smaller sinkage dimension [m]
  *       [ , area, <anor>, ]               # contact area [m^2] (default: pi*b^2)
+ *       [ , hydrodynamic,               # optional hydrodynamic term
+ *             h,    <h>,                #   h = 0.5*rho*Cd  [kg/m^3]
+ *             VN0,  <vn0>, ]            #   reference velocity [m/s]
  *       [ , friction, <mu_s>, ]           # Coulomb coefficient [-]
  *       nodes, <N>,                       # number of nodes
  *           <label_1>, ..., <label_N>     # structural node labels
@@ -117,6 +126,11 @@ private:
 	                          * k_p=0 → elastic (no dissipation); k_p→1 → all plastic.
 	                          * Dissipation requires k_p > 1 - 2/(n+1), e.g. for n=1
 	                          * any k_p > 0 gives dissipation. Default: 0.5 */
+
+	/* ---- hydrodynamic (optional) ---- */
+	bool       m_bHydro;  /* enabled */
+	doublereal m_dH;      /* h = 0.5*rho*Cd  [kg/m^3] */
+	doublereal m_dVN0;    /* reference velocity for tanh [m/s] */
 
 	/* ---- friction ---- */
 	doublereal m_dMuS;
@@ -221,6 +235,7 @@ SurfaceImpactElem::SurfaceImpactElem(unsigned uLabel, const DofOwner *pDO,
 m_Normal(Zero3), m_PlanePoint(Zero3),
 m_dKc(0.), m_dKphi(0.), m_dNbek(1.), m_dB(1.), m_dANOR(0.),
 m_dKplastic(0.5),
+m_bHydro(false), m_dH(0.), m_dVN0(1.),
 m_dMuS(0.), m_nNodes(0)
 {
 	if (HP.IsKeyWord("help")) {
@@ -235,6 +250,7 @@ m_dMuS(0.), m_nNodes(0)
 			"      pad radius, <b>,\n"
 			"      [ , area, <anor>, ]\n"
 			"      [ , plastic ratio, <k_p>, ]\n"
+			"      [ , hydrodynamic, h, <h>, VN0, <vn0>, ]\n"
 			"      [ , friction, <mu_s>, ]\n"
 			"      nodes, <N>, <label_1>, ..., <label_N>;\n"
 			<< std::endl);
@@ -348,6 +364,37 @@ m_dMuS(0.), m_nNodes(0)
 		if (m_dKplastic <= 0. || m_dKplastic >= 1.) {
 			silent_cerr("SurfaceImpactElem(" << uLabel
 				<< "): plastic ratio must be in (0, 1) at line "
+				<< HP.GetLineData() << std::endl);
+			throw ErrGeneric(MBDYN_EXCEPT_ARGS);
+		}
+	}
+
+	/* hydrodynamic (optional): FNH = h * ANOR * VN^2 * tanh(VN/VN0) */
+	if (HP.IsKeyWord("hydrodynamic")) {
+		m_bHydro = true;
+		if (!HP.IsKeyWord("h")) {
+			silent_cerr("SurfaceImpactElem(" << uLabel
+				<< "): \"h\" expected after \"hydrodynamic\" at line "
+				<< HP.GetLineData() << std::endl);
+			throw ErrGeneric(MBDYN_EXCEPT_ARGS);
+		}
+		m_dH = HP.GetReal();
+		if (m_dH <= 0.) {
+			silent_cerr("SurfaceImpactElem(" << uLabel
+				<< "): h must be > 0 at line "
+				<< HP.GetLineData() << std::endl);
+			throw ErrGeneric(MBDYN_EXCEPT_ARGS);
+		}
+		if (!HP.IsKeyWord("VN0")) {
+			silent_cerr("SurfaceImpactElem(" << uLabel
+				<< "): \"VN0\" expected after h at line "
+				<< HP.GetLineData() << std::endl);
+			throw ErrGeneric(MBDYN_EXCEPT_ARGS);
+		}
+		m_dVN0 = HP.GetReal();
+		if (m_dVN0 <= 0.) {
+			silent_cerr("SurfaceImpactElem(" << uLabel
+				<< "): VN0 must be > 0 at line "
 				<< HP.GetLineData() << std::endl);
 			throw ErrGeneric(MBDYN_EXCEPT_ARGS);
 		}
@@ -470,8 +517,18 @@ SubVectorHandler& SurfaceImpactElem::AssRes(
 			}
 		}
 
+		/* ---- Hydrodynamic (optional): FNH = h*ANOR*VN^2*tanh(VN/VN0) ---- */
+		doublereal FNH = 0.;
+		if (m_bHydro) {
+			doublereal VN = -(v.Dot(m_Normal));   /* positive = approaching */
+			if (VN > 0.) {
+				doublereal th = std::tanh(VN / m_dVN0);
+				FNH = m_dH * m_dANOR * VN * VN * th;
+			}
+		}
+
 		/* ---- Total normal force ---- */
-		doublereal FN = F_BEK;
+		doublereal FN = F_BEK + FNH;
 
 		(void)dFBEK_dz;   /* computed fresh in AssJac */
 
@@ -529,6 +586,7 @@ VariableSubMatrixHandler& SurfaceImpactElem::AssJac(
 		}
 
 		const Vec3& x = pNode->GetXCurr();
+		const Vec3& v = pNode->GetVCurr();
 
 		doublereal d = (x - m_PlanePoint).Dot(m_Normal);
 		if (d >= 0.) {
@@ -538,7 +596,7 @@ VariableSubMatrixHandler& SurfaceImpactElem::AssJac(
 
 		doublereal z = -d;
 
-		/* Bekker stiffness (position-dependent, with dCoef).
+		/* Bekker stiffness (position-dependent, multiplied by dCoef).
 		 * Loading:    dF/dz = ANOR*KBek*n*z^(n-1)
 		 * Unloading:  dF/dz = ANOR*Ku   (only for z > z0; zero in free zone) */
 		doublereal dFBEK_dz;
@@ -552,9 +610,24 @@ VariableSubMatrixHandler& SurfaceImpactElem::AssJac(
 			dFBEK_dz = 0.;   /* free zone: no force gradient */
 		}
 
-		/* z = -d = -(x-P0)·n  →  dz/dx_k = -n_k
-		 * dF_j/dx_k = dF/dz * (-n_k) * n_j  →  J_jk = -dCoef * dFBEK_dz * n_j * n_k */
-		doublereal Jnn = -dCoef * dFBEK_dz;
+		/* Hydrodynamic velocity term (no dCoef factor):
+		 * FNH = h*ANOR*VN^2*tanh(VN/VN0), VN = -(v·n)
+		 * dFNH/dVN = h*ANOR*VN*(2*tanh + VN/VN0*sech^2)
+		 * dFNH/dv_k = dFNH/dVN * (-n_k)  →  J_jk += -dFNH_dVN * n_j * n_k */
+		doublereal dFNH_dVN = 0.;
+		if (m_bHydro) {
+			doublereal VN = -(v.Dot(m_Normal));
+			if (VN > 0.) {
+				doublereal th    = std::tanh(VN / m_dVN0);
+				doublereal sech2 = 1.0 - th * th;
+				dFNH_dVN = m_dH * m_dANOR
+				         * VN * (2.0 * th + (VN / m_dVN0) * sech2);
+			}
+		}
+
+		/* Combined: Jnn = -(dCoef*dFBEK_dz + dFNH_dVN)
+		 * (velocity contribution has no dCoef because it acts on XPrimeCurr) */
+		doublereal Jnn = -(dCoef * dFBEK_dz + dFNH_dVN);
 
 		for (integer j = 1; j <= 3; j++) {
 			for (integer k = 1; k <= 3; k++) {
@@ -615,8 +688,12 @@ std::ostream& SurfaceImpactElem::Restart(std::ostream& out) const
 		<< ", n, "            << m_dNbek
 		<< ", pad radius, "   << m_dB
 		<< ", area, "         << m_dANOR
-		<< ", plastic ratio, "<< m_dKplastic
-		<< ", friction, " << m_dMuS
+		<< ", plastic ratio, "<< m_dKplastic;
+	if (m_bHydro) {
+		out << ", hydrodynamic, h, " << m_dH
+		    << ", VN0, "              << m_dVN0;
+	}
+	out << ", friction, " << m_dMuS
 		<< ", nodes, " << m_nNodes;
 	for (unsigned i = 0; i < m_nNodes; i++) {
 		out << ", " << m_Nodes[i]->GetLabel();
