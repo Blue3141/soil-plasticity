@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "WebFetch(domain:public.gitlab.polimi.it)",
-      "Bash(xargs grep:*)",
-      "Bash(grep -n \"SetCL1D\\\\|SetUDE\\\\|module_init\" /tmp/mbdyn/mbdyn/base/dataman*.h)"
-    ]
-  }
-}
