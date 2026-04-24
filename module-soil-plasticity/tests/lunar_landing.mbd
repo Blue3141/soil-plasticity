@@ -4,8 +4,9 @@
  * Una massa di 500 kg scende a 3 m/s. Il piano è z=0, normale (0,0,1).
  * Il nodo parte da z=0.5 m, quindi entra in contatto dopo ~0.17 s.
  *
- * Hunt-Crossley: F_damp = alpha * F_BEK * VN
- *   alpha ≈ 3*(1-e^2)/(2*e*VN_impact) = 3*(1-0.25)/(2*0.5*3) = 0.75 s/m
+ * Smorzamento da plasticita' Bekker (k_p = 0.5):
+ *   z0 = 0.5 * z_max,  Ku = KBek / 0.5 = 2*KBek
+ *   Energia dissipata per ciclo: E_diss = k_p/2 * A*KBek*z_max^2
  *   ANOR  = pi * 0.1^2 = 0.0314 m^2  (pad circolare r=0.1 m)
  *
  * Usage:
@@ -62,8 +63,6 @@ begin: elements;
         n,             1.0,
         pad radius,    0.10,
         plastic ratio, 0.5,
-        /* Hunt-Crossley damping: alpha ≈ 3*(1-e^2)/(2*e*VN) con e=0.5, VN=3 m/s */
-        damping ratio, 0.75,
         friction, 0.4,
         nodes, 1,
             1;
