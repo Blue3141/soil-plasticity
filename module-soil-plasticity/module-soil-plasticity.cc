@@ -148,8 +148,13 @@ private:
 	/* ---- per-node plastic state ---- */
 	std::vector<doublereal> m_dZmax;        /* committed max sinkage [m] */
 	std::vector<doublereal> m_dZmax_trial;  /* trial (grows within timestep) */
-	std::vector<doublereal> m_dKu;          /* unloading stiffness [N/m^(n+1)*m^n] */
+	std::vector<doublereal> m_dKu;          /* unloading stiffness */
 	std::vector<doublereal> m_dZ0;          /* permanent sinkage offset [m] */
+
+	/* ---- per-node private data (updated in AssRes, read via dGetPrivData) ---- */
+	mutable std::vector<doublereal> m_dFBEK;  /* Bekker normal force [N] */
+	mutable std::vector<doublereal> m_dFNH;   /* hydrodynamic normal force [N] */
+	mutable std::vector<doublereal> m_dFN;    /* total normal force [N] */
 
 	/* ---- output ---- */
 	mutable std::vector<Vec3> m_Forces;
@@ -202,7 +207,26 @@ public:
 	virtual void AfterConvergence(const VectorHandler& X,
 		const VectorHandler& XP);
 
-	virtual unsigned int iGetNumPrivData(void) const { return 0; }
+	/* Private data layout (1-based), 4 items per node:
+	 *   4*(i-1)+1  F_BEK  — Bekker normal force         [N]
+	 *   4*(i-1)+2  FNH    — hydrodynamic normal force   [N]
+	 *   4*(i-1)+3  FN     — total normal force           [N]
+	 *   4*(i-1)+4  z0     — permanent sinkage            [m]  */
+	virtual unsigned int iGetNumPrivData(void) const {
+		return 4 * m_nNodes;
+	}
+	virtual doublereal dGetPrivData(unsigned int i) const {
+		ASSERT(i >= 1 && i <= 4 * m_nNodes);
+		unsigned node  = (i - 1) / 4;
+		unsigned field = (i - 1) % 4;
+		switch (field) {
+		case 0: return m_dFBEK[node];
+		case 1: return m_dFNH[node];
+		case 2: return m_dFN[node];
+		case 3: return m_dZ0[node];
+		default: return 0.;
+		}
+	}
 	virtual int iGetNumConnectedNodes(void) const {
 		return static_cast<int>(m_nNodes);
 	}
@@ -451,6 +475,9 @@ m_dMuS(0.), m_nNodes(0)
 	m_dZmax_trial.resize(m_nNodes, 0.);
 	m_dKu.resize(m_nNodes, 0.);
 	m_dZ0.resize(m_nNodes, 0.);
+	m_dFBEK.resize(m_nNodes, 0.);
+	m_dFNH.resize(m_nNodes, 0.);
+	m_dFN.resize(m_nNodes, 0.);
 
 	for (unsigned i = 0; i < m_nNodes; i++) {
 		unsigned uNodeLabel = HP.GetInt();
@@ -494,6 +521,9 @@ SubVectorHandler& SurfaceImpactElem::AssRes(
 		}
 
 		m_Forces[i] = Zero3;
+		m_dFBEK[i]  = 0.;
+		m_dFNH[i]   = 0.;
+		m_dFN[i]    = 0.;
 
 		const Vec3& x = pNode->GetXCurr();
 		const Vec3& v = pNode->GetVCurr();
@@ -538,23 +568,28 @@ SubVectorHandler& SurfaceImpactElem::AssRes(
 
 		/* ---- Hydrodynamic (optional) ----
 		 * FNH = h*ANOR*VN^2*tanh(VN/VN0)*tanh((z-z0)/ZN0)
-		 * Active only for VN>0 and z>z0 (soil compressing above permanent sinkage).
-		 * The spatial tanh provides both the threshold and a smooth ramp-up. */
+		 * Active for any VN (loading and unloading) whenever z > z0.
+		 * VN²*tanh(VN/VN0) is odd in VN: resists motion in both directions.
+		 * The spatial tanh provides threshold (zero at z0) and smooth ramp. */
 		doublereal FNH = 0.;
 		if (m_bHydro) {
-			doublereal VN = -(v.Dot(m_Normal));
-			if (VN > 0.) {
-				doublereal dz_eff = z - m_dZ0[i];
-				doublereal ramp = std::tanh(dz_eff / m_dZN0);
-				if (ramp > 0.) {
-					doublereal th = std::tanh(VN / m_dVN0);
-					FNH = m_dH * m_dANOR * VN * VN * th * ramp;
-				}
+			doublereal dz_eff = z - m_dZ0[i];
+			doublereal ramp   = std::tanh(dz_eff / m_dZN0);
+			if (ramp > 0.) {
+				doublereal VN = -(v.Dot(m_Normal));
+				doublereal th = std::tanh(VN / m_dVN0);
+				FNH = m_dH * m_dANOR * VN * VN * th * ramp;
 			}
 		}
 
 		/* ---- Total normal force ---- */
 		doublereal FN = F_BEK + FNH;
+		if (FN < 0.) FN = 0.;
+
+		/* store private data for this iteration */
+		m_dFBEK[i] = F_BEK;
+		m_dFNH[i]  = FNH;
+		m_dFN[i]   = FN;
 
 		(void)dFBEK_dz;   /* computed fresh in AssJac */
 
@@ -648,18 +683,19 @@ VariableSubMatrixHandler& SurfaceImpactElem::AssJac(
 		 *   dFNH/dx_k = dFNH/dz * (-n_k) */
 		doublereal dFNH_dVN = 0., dFNH_dz = 0.;
 		if (m_bHydro) {
-			doublereal VN = -(v.Dot(m_Normal));
-			if (VN > 0.) {
-				doublereal dz_eff = z - m_dZ0[i];
-				doublereal ramp   = std::tanh(dz_eff / m_dZN0);
-				if (ramp > 0.) {
-					doublereal sech2_z = 1.0 - ramp * ramp;
-					doublereal th_v    = std::tanh(VN / m_dVN0);
-					doublereal sech2_v = 1.0 - th_v * th_v;
-					doublereal base    = m_dH * m_dANOR * VN;
-					dFNH_dVN = base * (2.0 * th_v + (VN / m_dVN0) * sech2_v) * ramp;
-					dFNH_dz  = base * VN * th_v * sech2_z / m_dZN0;
-				}
+			doublereal dz_eff = z - m_dZ0[i];
+			doublereal ramp   = std::tanh(dz_eff / m_dZN0);
+			if (ramp > 0.) {
+				doublereal VN      = -(v.Dot(m_Normal));
+				doublereal sech2_z = 1.0 - ramp * ramp;
+				doublereal th_v    = std::tanh(VN / m_dVN0);
+				doublereal sech2_v = 1.0 - th_v * th_v;
+				doublereal base    = m_dH * m_dANOR * VN;
+				/* dFNH/dVN = h*A*ramp*(2*VN*tanh_v + VN²/VN0*sech2_v)
+				 *          = h*A*ramp*VN*(2*tanh_v + VN/VN0*sech2_v)
+				 * This is always >= 0 (VN²*tanh(VN/VN0) is monotone increasing) */
+				dFNH_dVN = base * (2.0 * th_v + (VN / m_dVN0) * sech2_v) * ramp;
+				dFNH_dz  = base * VN * th_v * sech2_z / m_dZN0;
 			}
 		}
 
