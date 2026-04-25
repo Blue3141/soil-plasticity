@@ -566,19 +566,20 @@ SubVectorHandler& SurfaceImpactElem::AssRes(
 			}
 		}
 
-		/* ---- Hydrodynamic (optional) ----
+		/* ---- Hydrodynamic (optional): only during compression (VN > 0) ----
 		 * FNH = h*ANOR*VN^2*tanh(VN/VN0)*tanh((z-z0)/ZN0)
-		 * Active for any VN (loading and unloading) whenever z > z0.
-		 * VN²*tanh(VN/VN0) is odd in VN: resists motion in both directions.
-		 * The spatial tanh provides threshold (zero at z0) and smooth ramp. */
+		 * Active only when approaching (VN>0) and above permanent sinkage (z>z0).
+		 * The spatial tanh provides the threshold and smooth ramp-up from z0. */
 		doublereal FNH = 0.;
 		if (m_bHydro) {
-			doublereal dz_eff = z - m_dZ0[i];
-			doublereal ramp   = std::tanh(dz_eff / m_dZN0);
-			if (ramp > 0.) {
-				doublereal VN = -(v.Dot(m_Normal));
-				doublereal th = std::tanh(VN / m_dVN0);
-				FNH = m_dH * m_dANOR * VN * VN * th * ramp;
+			doublereal VN = -(v.Dot(m_Normal));
+			if (VN > 0.) {
+				doublereal dz_eff = z - m_dZ0[i];
+				doublereal ramp   = std::tanh(dz_eff / m_dZN0);
+				if (ramp > 0.) {
+					doublereal th = std::tanh(VN / m_dVN0);
+					FNH = m_dH * m_dANOR * VN * VN * th * ramp;
+				}
 			}
 		}
 
@@ -683,19 +684,18 @@ VariableSubMatrixHandler& SurfaceImpactElem::AssJac(
 		 *   dFNH/dx_k = dFNH/dz * (-n_k) */
 		doublereal dFNH_dVN = 0., dFNH_dz = 0.;
 		if (m_bHydro) {
-			doublereal dz_eff = z - m_dZ0[i];
-			doublereal ramp   = std::tanh(dz_eff / m_dZN0);
-			if (ramp > 0.) {
-				doublereal VN      = -(v.Dot(m_Normal));
-				doublereal sech2_z = 1.0 - ramp * ramp;
-				doublereal th_v    = std::tanh(VN / m_dVN0);
-				doublereal sech2_v = 1.0 - th_v * th_v;
-				doublereal base    = m_dH * m_dANOR * VN;
-				/* dFNH/dVN = h*A*ramp*(2*VN*tanh_v + VN²/VN0*sech2_v)
-				 *          = h*A*ramp*VN*(2*tanh_v + VN/VN0*sech2_v)
-				 * This is always >= 0 (VN²*tanh(VN/VN0) is monotone increasing) */
-				dFNH_dVN = base * (2.0 * th_v + (VN / m_dVN0) * sech2_v) * ramp;
-				dFNH_dz  = base * VN * th_v * sech2_z / m_dZN0;
+			doublereal VN = -(v.Dot(m_Normal));
+			if (VN > 0.) {
+				doublereal dz_eff = z - m_dZ0[i];
+				doublereal ramp   = std::tanh(dz_eff / m_dZN0);
+				if (ramp > 0.) {
+					doublereal sech2_z = 1.0 - ramp * ramp;
+					doublereal th_v    = std::tanh(VN / m_dVN0);
+					doublereal sech2_v = 1.0 - th_v * th_v;
+					doublereal base    = m_dH * m_dANOR * VN;
+					dFNH_dVN = base * (2.0 * th_v + (VN / m_dVN0) * sech2_v) * ramp;
+					dFNH_dz  = base * VN * th_v * sech2_z / m_dZN0;
+				}
 			}
 		}
 
